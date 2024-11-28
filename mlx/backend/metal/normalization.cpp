@@ -78,21 +78,18 @@ void RMSNorm::eval_gpu(
     }
 
     uint32_t w_stride = w.strides()[0];
-    compute_encoder->setComputePipelineState(kernel);
+    compute_encoder.set_compute_pipeline_state(kernel);
     compute_encoder.set_input_array(
         x.data_shared_ptr() == nullptr ? out : x, 0);
     compute_encoder.set_input_array(w, 1);
     compute_encoder.set_output_array(out, 2);
-    compute_encoder->setBytes(&eps_, sizeof(float), 3);
-    compute_encoder->setBytes(&axis_size, sizeof(int), 4);
-    compute_encoder->setBytes(&w_stride, sizeof(uint32_t), 5);
-    compute_encoder->setThreadgroupMemoryLength(
-        16 * 8, 0); // minimum of 16 bytes
-    compute_encoder->setThreadgroupMemoryLength(simd_size * sizeof(float), 1);
-    compute_encoder.dispatchThreads(grid_dims, group_dims);
+    compute_encoder.set_bytes(eps_, 3);
+    compute_encoder.set_bytes(axis_size, 4);
+    compute_encoder.set_bytes(w_stride, 5);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
   }
-  d.get_command_buffer(s.index)->addCompletedHandler(
-      [copies](MTL::CommandBuffer*) mutable { copies.clear(); });
+
+  d.add_temporaries(std::move(copies), s.index);
 }
 
 void RMSNormVJP::eval_gpu(
@@ -109,6 +106,12 @@ void RMSNormVJP::eval_gpu(
     if (x.flags().row_contiguous) {
       return x;
     }
+    // Make sure we 'll only ever allocate once. The point of that goes beyond
+    // the minor optimization. We need to ensure that there will be no
+    // reallocation such that the references won't change when we
+    // push_back(...). So tl;dr 3 possible copies x, g and gw_temp.
+    copies.reserve(3);
+
     copies.push_back(array(x.shape(), x.dtype(), nullptr, {}));
     copy_gpu(x, copies.back(), CopyType::General, s);
     return copies.back();
@@ -177,16 +180,16 @@ void RMSNormVJP::eval_gpu(
     }
 
     uint32_t w_stride = w.strides()[0];
-    compute_encoder->setComputePipelineState(kernel);
+    compute_encoder.set_compute_pipeline_state(kernel);
     compute_encoder.set_input_array(x_in_gx ? gx : x, 0);
     compute_encoder.set_input_array(w, 1);
     compute_encoder.set_input_array(g_in_gx ? gx : (g_in_gw ? gw_temp : g), 2);
     compute_encoder.set_output_array(gx, 3);
     compute_encoder.set_output_array(gw_temp, 4);
-    compute_encoder->setBytes(&eps_, sizeof(float), 5);
-    compute_encoder->setBytes(&axis_size, sizeof(int), 6);
-    compute_encoder->setBytes(&w_stride, sizeof(uint32_t), 7);
-    compute_encoder.dispatchThreads(grid_dims, group_dims);
+    compute_encoder.set_bytes(eps_, 5);
+    compute_encoder.set_bytes(axis_size, 6);
+    compute_encoder.set_bytes(w_stride, 7);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
   }
 
   ReductionPlan plan(
@@ -194,8 +197,7 @@ void RMSNormVJP::eval_gpu(
   strided_reduce_general_dispatch(
       gw_temp, gw, "sum", plan, {0}, compute_encoder, d, s);
 
-  d.get_command_buffer(s.index)->addCompletedHandler(
-      [copies](MTL::CommandBuffer*) mutable { copies.clear(); });
+  d.add_temporaries(std::move(copies), s.index);
 }
 
 void LayerNorm::eval_gpu(
@@ -268,20 +270,20 @@ void LayerNorm::eval_gpu(
 
     uint32_t w_stride = (w.ndim() == 1) ? w.strides()[0] : 0;
     uint32_t b_stride = (b.ndim() == 1) ? b.strides()[0] : 0;
-    compute_encoder->setComputePipelineState(kernel);
+    compute_encoder.set_compute_pipeline_state(kernel);
     compute_encoder.set_input_array(
         x.data_shared_ptr() == nullptr ? out : x, 0);
     compute_encoder.set_input_array(w, 1);
     compute_encoder.set_input_array(b, 2);
     compute_encoder.set_output_array(out, 3);
-    compute_encoder->setBytes(&eps_, sizeof(float), 4);
-    compute_encoder->setBytes(&axis_size, sizeof(int), 5);
-    compute_encoder->setBytes(&w_stride, sizeof(uint32_t), 6);
-    compute_encoder->setBytes(&b_stride, sizeof(uint32_t), 7);
-    compute_encoder.dispatchThreads(grid_dims, group_dims);
+    compute_encoder.set_bytes(eps_, 4);
+    compute_encoder.set_bytes(axis_size, 5);
+    compute_encoder.set_bytes(w_stride, 6);
+    compute_encoder.set_bytes(b_stride, 7);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
   }
-  d.get_command_buffer(s.index)->addCompletedHandler(
-      [copies](MTL::CommandBuffer*) mutable { copies.clear(); });
+
+  d.add_temporaries(std::move(copies), s.index);
 }
 
 void LayerNormVJP::eval_gpu(
@@ -298,6 +300,12 @@ void LayerNormVJP::eval_gpu(
     if (x.flags().row_contiguous) {
       return x;
     }
+    // Make sure we 'll only ever allocate once. The point of that goes beyond
+    // the minor optimization. We need to ensure that there will be no
+    // reallocation such that the references won't change when we
+    // push_back(...). So tl;dr 3 possible copies x, g and gw_temp.
+    copies.reserve(3);
+
     copies.push_back(array(x.shape(), x.dtype(), nullptr, {}));
     copy_gpu(x, copies.back(), CopyType::General, s);
     return copies.back();
@@ -384,16 +392,16 @@ void LayerNormVJP::eval_gpu(
     }
 
     uint32_t w_stride = (w.ndim() == 1) ? w.strides()[0] : 0;
-    compute_encoder->setComputePipelineState(kernel);
+    compute_encoder.set_compute_pipeline_state(kernel);
     compute_encoder.set_input_array(x_in_gx ? gx : x, 0);
     compute_encoder.set_input_array(w, 1);
     compute_encoder.set_input_array(g_in_gx ? gx : (g_in_gw ? gw_temp : g), 2);
     compute_encoder.set_output_array(gx, 3);
     compute_encoder.set_output_array(gw_temp, 4);
-    compute_encoder->setBytes(&eps_, sizeof(float), 5);
-    compute_encoder->setBytes(&axis_size, sizeof(int), 6);
-    compute_encoder->setBytes(&w_stride, sizeof(uint32_t), 7);
-    compute_encoder.dispatchThreads(grid_dims, group_dims);
+    compute_encoder.set_bytes(eps_, 5);
+    compute_encoder.set_bytes(axis_size, 6);
+    compute_encoder.set_bytes(w_stride, 7);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
   }
 
   if (gw.ndim() == 1 && gw.size() == axis_size) {
@@ -403,8 +411,7 @@ void LayerNormVJP::eval_gpu(
         gw_temp, gw, "sum", plan, {0}, compute_encoder, d, s);
   }
 
-  d.get_command_buffer(s.index)->addCompletedHandler(
-      [copies](MTL::CommandBuffer*) mutable { copies.clear(); });
+  d.add_temporaries(std::move(copies), s.index);
 }
 
 } // namespace mlx::core::fast

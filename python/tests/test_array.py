@@ -2,6 +2,7 @@
 
 import operator
 import pickle
+import resource
 import sys
 import unittest
 import weakref
@@ -687,6 +688,13 @@ class TestArray(mlx_tests.MLXTestCase):
             b_npy = np.array(b_mlx)
 
             self.assertEqual(b_npy.dtype, np_dtype)
+
+    def test_array_from_noncontiguous_np(self):
+        for t in [np.int8, np.int32, np.float16, np.float32, np.complex64]:
+            np_arr = np.random.uniform(size=(10, 10)).astype(np.complex64)
+            np_arr = np_arr.T
+            mx_arr = mx.array(np_arr)
+            self.assertTrue(mx.array_equal(np_arr, mx_arr))
 
     def test_array_np_shape_dim_check(self):
         a_npy = np.empty(2**31, dtype=np.bool_)
@@ -1764,6 +1772,19 @@ class TestArray(mlx_tests.MLXTestCase):
         peak_2 = mx.metal.get_peak_memory()
         self.assertEqual(peak_1, peak_2)
 
+        def fun():
+            a = mx.array([1.0, 2.0, 3.0, 4.0])
+            b, _ = mx.divmod(a, a)
+            return mx.log(b)
+
+        fun()
+        mx.synchronize()
+        peak_1 = mx.metal.get_peak_memory()
+        fun()
+        mx.synchronize()
+        peak_2 = mx.metal.get_peak_memory()
+        self.assertEqual(peak_1, peak_2)
+
     def test_add_numpy(self):
         x = mx.array(1)
         y = np.array(2, dtype=np.int32)
@@ -1867,6 +1888,65 @@ class TestArray(mlx_tests.MLXTestCase):
             float(a)
         with self.assertRaises(ValueError):
             int(a)
+
+    def test_format(self):
+        a = mx.arange(3)
+        self.assertEqual(f"{a[0]:.2f}", "0.00")
+
+        b = mx.array(0.35487)
+        self.assertEqual(f"{b:.1f}", "0.4")
+
+        with self.assertRaises(TypeError):
+            s = f"{a:.2f}"
+
+        a = mx.array([1, 2, 3])
+        self.assertEqual(f"{a}", "array([1, 2, 3], dtype=int32)")
+
+    def test_deep_graphs(self):
+        # The following tests should simply run cleanly without a segfault or
+        # crash due to exceeding recursion depth limits.
+
+        # Deep graph destroyed without eval
+        x = mx.array([1.0, 2.0])
+        for _ in range(100_000):
+            x = mx.sin(x)
+        del x
+
+        # Duplicate input deep graph destroyed without eval
+        x = mx.array([1.0, 2.0])
+        for _ in range(100_000):
+            x = x + x
+
+        # Deep graph with siblings destroyed without eval
+        x = mx.array([1, 2])
+        for _ in range(100_000):
+            x = mx.concatenate(mx.split(x, 2))
+        del x
+
+        # Deep graph with eval
+        x = mx.array([1.0, 2.0])
+        for _ in range(100_000):
+            x = mx.sin(x)
+        mx.eval(x)
+
+    def test_siblings_without_eval(self):
+        def get_mem():
+            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+        key = mx.array([1, 2])
+
+        def t():
+            a, b = mx.split(key, 2)
+            a = mx.reshape(a, [])
+            b = mx.reshape(b, [])
+            return b
+
+        t()
+        expected = get_mem()
+        for _ in range(100):
+            t()
+        used = get_mem()
+        self.assertEqual(expected, used)
 
 
 if __name__ == "__main__":

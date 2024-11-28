@@ -1,13 +1,27 @@
-set(BASE_HEADERS bf16.h bf16_math.h complex.h defines.h expm1f.h utils.h)
+set(BASE_HEADERS
+    metal_3_1/bf16.h
+    metal_3_0/bf16.h
+    bf16_math.h
+    complex.h
+    defines.h
+    expm1f.h
+    utils.h)
 
 function(build_kernel_base TARGET SRCFILE DEPS)
   set(METAL_FLAGS -Wall -Wextra -fno-fast-math)
   if(MLX_METAL_DEBUG)
     set(METAL_FLAGS ${METAL_FLAGS} -gline-tables-only -frecord-sources)
   endif()
+  if(MLX_METAL_VERSION GREATER_EQUAL 310)
+    set(VERSION_INCLUDES
+        ${PROJECT_SOURCE_DIR}/mlx/backend/metal/kernels/metal_3_1)
+  else()
+    set(VERSION_INCLUDES
+        ${PROJECT_SOURCE_DIR}/mlx/backend/metal/kernels/metal_3_0)
+  endif()
   add_custom_command(
     COMMAND xcrun -sdk macosx metal ${METAL_FLAGS} -c ${SRCFILE}
-            -I${PROJECT_SOURCE_DIR} -o ${TARGET}.air
+            -I${PROJECT_SOURCE_DIR} -I${VERSION_INCLUDES} -o ${TARGET}.air
     DEPENDS ${SRCFILE} ${DEPS} ${BASE_HEADERS}
     OUTPUT ${TARGET}.air
     COMMENT "Building ${TARGET}.air"
@@ -30,8 +44,7 @@ build_kernel(layer_norm)
 build_kernel(random)
 build_kernel(rms_norm)
 build_kernel(rope)
-build_kernel(scaled_dot_product_attention scaled_dot_product_attention_params.h
-             steel/defines.h steel/gemm/transforms.h steel/utils.h)
+build_kernel(scaled_dot_product_attention sdpa_vector.h)
 
 set(STEEL_HEADERS
     steel/defines.h
@@ -49,7 +62,27 @@ set(STEEL_HEADERS
     steel/gemm/transforms.h
     steel/gemm/kernels/steel_gemm_fused.h
     steel/gemm/kernels/steel_gemm_masked.h
-    steel/gemm/kernels/steel_gemm_splitk.h)
+    steel/gemm/kernels/steel_gemm_splitk.h
+    steel/utils/type_traits.h
+    steel/utils/integral_constant.h)
+
+set(STEEL_ATTN_HEADERS
+    steel/defines.h
+    steel/utils.h
+    steel/gemm/gemm.h
+    steel/gemm/mma.h
+    steel/gemm/loader.h
+    steel/gemm/transforms.h
+    steel/utils/type_traits.h
+    steel/utils/integral_constant.h
+    steel/attn/attn.h
+    steel/attn/loader.h
+    steel/attn/mma.h
+    steel/attn/params.h
+    steel/attn/transforms.h
+    steel/attn/kernels/steel_attention.h)
+
+build_kernel(steel/attn/kernels/steel_attention ${STEEL_ATTN_HEADERS})
 
 if(NOT MLX_METAL_JIT)
   build_kernel(arange arange.h)

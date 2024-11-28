@@ -1,5 +1,4 @@
 // Copyright © 2023-2024 Apple Inc.
-
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -767,6 +766,27 @@ std::pair<std::vector<array>, std::vector<int>> Cholesky::vmap(
   return {{linalg::cholesky(a, upper_, stream())}, {ax}};
 }
 
+std::pair<std::vector<array>, std::vector<int>> Eigh::vmap(
+    const std::vector<array>& inputs,
+    const std::vector<int>& axes) {
+  assert(inputs.size() == 1);
+  assert(axes.size() == 1);
+
+  bool needs_move = axes[0] >= (inputs[0].ndim() - 2);
+  auto a = needs_move ? moveaxis(inputs[0], axes[0], 0, stream()) : inputs[0];
+  auto ax = needs_move ? 0 : axes[0];
+
+  std::vector<array> outputs;
+  if (compute_eigenvectors_) {
+    auto [values, vectors] = linalg::eigh(a, uplo_, stream());
+    outputs = {values, vectors};
+  } else {
+    outputs = {linalg::eigvalsh(a, uplo_, stream())};
+  }
+
+  return {outputs, std::vector<int>(outputs.size(), ax)};
+}
+
 std::vector<array> Concatenate::vjp(
     const std::vector<array>& primals,
     const std::vector<array>& cotangents,
@@ -816,31 +836,43 @@ std::vector<array> Concatenate::jvp(
 std::pair<std::vector<array>, std::vector<int>> Concatenate::vmap(
     const std::vector<array>& inputs,
     const std::vector<int>& axes) {
-  std::vector<array> t_inputs;
   int out_ax = -1;
+  int first_vmap = -1;
+
   // Find the first vmapped input
-  int i = 0;
-  for (; i < axes.size(); i++) {
-    t_inputs.push_back(inputs[i]);
+  for (int i = 0; i < axes.size(); i++) {
     if (axes[i] >= 0) {
       out_ax = axes[i];
+      first_vmap = i;
       break;
     }
   }
-  if (out_ax >= 0) {
-    // Advance to the next input
-    i++;
 
-    // Move vmap axes to the same spot.
-    for (; i < axes.size(); ++i) {
-      if (out_ax != axes[i] && axes[i] >= 0) {
+  // No vmap, should we even be in here?
+  if (out_ax < 0) {
+    return {{concatenate(inputs, axis_, stream())}, {out_ax}};
+  }
+
+  // Make sure vmapped arrays have all vmapped axes in the same location and
+  // expand non-vmapped arrays to be compatible with the vmapped ones.
+  std::vector<array> t_inputs;
+  int N = inputs[first_vmap].shape(out_ax);
+  int axis = axis_ + (axis_ >= out_ax);
+  auto cat_shape = inputs[first_vmap].shape();
+  for (int i = 0; i < axes.size(); i++) {
+    if (axes[i] >= 0) {
+      if (out_ax != axes[i]) {
         t_inputs.push_back(moveaxis(inputs[i], axes[i], out_ax, stream()));
       } else {
         t_inputs.push_back(inputs[i]);
       }
+    } else {
+      cat_shape[axis] = inputs[i].shape(axis_);
+      t_inputs.push_back(broadcast_to(
+          expand_dims(inputs[i], out_ax, stream()), cat_shape, stream()));
     }
   }
-  auto axis = axis_ + (out_ax >= 0 && axis_ >= out_ax);
+
   return {{concatenate(t_inputs, axis, stream())}, {out_ax}};
 }
 
@@ -855,6 +887,32 @@ std::pair<std::vector<array>, std::vector<int>> Conjugate::vmap(
   assert(inputs.size() == 1);
   assert(axes.size() == 1);
   return {{conjugate(inputs[0], stream())}, axes};
+}
+
+std::vector<array> Contiguous::vjp(
+    const std::vector<array>&,
+    const std::vector<array>& cotangents,
+    const std::vector<int>&,
+    const std::vector<array>&) {
+  return {cotangents};
+}
+
+std::vector<array> Contiguous::jvp(
+    const std::vector<array>&,
+    const std::vector<array>& tangents,
+    const std::vector<int>&) {
+  return {tangents};
+}
+
+std::pair<std::vector<array>, std::vector<int>> Contiguous::vmap(
+    const std::vector<array>& inputs,
+    const std::vector<int>& axes) {
+  return {{contiguous(inputs[0], allow_col_major_, stream())}, axes};
+}
+
+bool Contiguous::is_equivalent(const Primitive& other) const {
+  const Contiguous& c_other = static_cast<const Contiguous&>(other);
+  return allow_col_major_ == c_other.allow_col_major_;
 }
 
 array conv_weight_backward_patches(
@@ -929,15 +987,27 @@ std::vector<array> Convolution::vjp(
   assert(primals.size() == 2);
   std::vector<array> grads;
 
-  if (groups_ != 1) {
-    throw std::invalid_argument(
-        "[Convolution] Backward pass not implemented for groups > 1.");
-  }
-
   // Collect info
   auto& in = primals[0];
   auto& wt = primals[1];
   auto& cotan = cotangents[0];
+
+  auto group_transpose =
+      [this](const array& x, int group_dim, int ax_a, int ax_b) {
+        if (groups_ > 1) {
+          auto shape = x.shape();
+          if (group_dim < 0) {
+            group_dim += shape.size();
+          }
+          shape.insert(shape.begin() + group_dim, groups_);
+          shape[group_dim + 1] = shape[group_dim + 1] / groups_;
+          auto x_trans = swapaxes(
+              reshape(x, std::move(shape), stream()), ax_a, ax_b, stream());
+          return flatten(x_trans, group_dim, group_dim + 1, stream());
+        } else {
+          return swapaxes(x, 0, -1, stream());
+        }
+      };
 
   for (int a : argnums) {
     // Grads for input
@@ -976,8 +1046,7 @@ std::vector<array> Convolution::vjp(
         }
       }
 
-      auto wt_trans = swapaxes(wt, 0, -1, stream());
-
+      auto wt_trans = group_transpose(wt, 0, 1, -1);
       auto grad = conv_general(
           /* const array& input = */ cotan,
           /* const array& weight = */ wt_trans,
@@ -986,7 +1055,7 @@ std::vector<array> Convolution::vjp(
           /* std::vector<int> padding_hi = */ padding_hi,
           /* std::vector<int> kernel_dilation = */ kernel_dilation_,
           /* std::vector<int> input_dilation = */ kernel_strides_,
-          /* int groups = */ 1,
+          /* int groups = */ groups_,
           /* bool flip = */ !flip_,
           stream());
 
@@ -1020,20 +1089,20 @@ std::vector<array> Convolution::vjp(
         no_dilation &= (input_dilation_[i] == 1) && (kernel_dilation_[i] == 1);
       }
 
-      if (no_dilation && !flip_) {
+      if (no_dilation && !flip_ && groups_ == 1) {
         auto grad = conv_weight_backward_patches(
             in, wt, cotan, kernel_strides_, padding_, stream());
         grads.push_back(grad);
       } else {
-        auto cotan_trans = swapaxes(cotan, 0, -1, stream());
-        auto in_trans = swapaxes(in, 0, -1, stream());
-
         if (flip_) {
           auto padding = padding_;
           for (int i = 0; i < padding.size(); i++) {
             int wt_size = 1 + kernel_dilation_[i] * (wt.shape(1 + i) - 1);
             padding[i] = wt_size - padding_[i] - 1;
           }
+
+          auto cotan_trans = group_transpose(cotan, -1, 0, -1);
+          auto in_trans = swapaxes(in, 0, -1, stream());
 
           auto grad_trans = conv_general(
               /* const array& input = */ cotan_trans,
@@ -1043,11 +1112,14 @@ std::vector<array> Convolution::vjp(
               /* std::vector<int> padding_hi = */ padding,
               /* std::vector<int> kernel_dilation = */ input_dilation_,
               /* std::vector<int> input_dilation = */ kernel_strides_,
-              /* int groups = */ 1,
+              /* int groups = */ groups_,
               /* bool flip = */ false,
               stream());
-          auto grad = swapaxes(grad_trans, 0, -1, stream());
-          grads.push_back(grad_trans);
+          if (groups_ > 1) {
+            grads.push_back(group_transpose(grad_trans, -1, 0, -2));
+          } else {
+            grads.push_back(grad_trans);
+          }
         } else {
           std::vector<int> padding_lo = padding_;
           std::vector<int> padding_hi = padding_;
@@ -1058,9 +1130,9 @@ std::vector<array> Convolution::vjp(
             int wt_size = 1 + kernel_dilation_[i] * (wt.shape(1 + i) - 1);
             padding_hi[i] = out_size - in_size + wt_size - padding_[i] - 1;
           }
-
-          auto in_trans = swapaxes(in, 0, -1, stream());
           auto cotan_trans = swapaxes(cotan, 0, -1, stream());
+          auto in_trans = group_transpose(in, -1, 0, -1);
+
           auto grad_trans = conv_general(
               /* const array& input = */ in_trans,
               /* const array& weight = */ cotan_trans,
@@ -1069,11 +1141,10 @@ std::vector<array> Convolution::vjp(
               /* std::vector<int> padding_hi = */ padding_hi,
               /* std::vector<int> kernel_dilation = */ kernel_strides_,
               /* std::vector<int> input_dilation = */ input_dilation_,
-              /* int groups = */ 1,
+              /* int groups = */ groups_,
               /* bool flip = */ false,
               stream());
-          auto grad = swapaxes(grad_trans, 0, -1, stream());
-          grads.push_back(grad);
+          grads.push_back(swapaxes(grad_trans, 0, -1, stream()));
         }
       }
     }
@@ -1649,48 +1720,58 @@ std::pair<std::vector<array>, std::vector<int>> Gather::vmap(
   auto gather_axes = axes_;
   auto slice_sizes = slice_sizes_;
   auto src_vmapped = axes[0] >= 0;
-  auto indices_vmapped =
-      std::any_of(axes.begin() + 1, axes.end(), [](int a) { return a >= 0; });
-  auto out_ax =
-      *std::find_if(axes.begin(), axes.end(), [](int a) { return a >= 0; });
+  auto ind_vmap_ax_ptr =
+      std::find_if(axes.begin() + 1, axes.end(), [](int a) { return a >= 0; });
+  int out_ax = -1;
+  bool indices_vmapped = (ind_vmap_ax_ptr != axes.end());
+  if (indices_vmapped) {
+    out_ax = *ind_vmap_ax_ptr;
+  } else if (src_vmapped) {
+    out_ax = axes[0];
+  }
 
   // Reorder all the index arrays so the vmap axis is in the same spot.
-  for (int i = 1; i < axes.size(); ++i) {
-    if (out_ax != axes[i] && axes[i] >= 0) {
-      indices[i - 1] = moveaxis(indices[i - 1], axes[i], out_ax, stream());
+  if (indices_vmapped) {
+    for (int i = 1; i < axes.size(); ++i) {
+      if (out_ax != axes[i] && axes[i] >= 0) {
+        indices[i - 1] = moveaxis(indices[i - 1], axes[i], out_ax, stream());
+      } else if (axes[i] < 0) {
+        indices[i - 1] = expand_dims(indices[i - 1], out_ax, stream());
+      }
     }
   }
 
+  int idx_dims = indices.empty() ? 0 : indices[0].ndim();
+
   if (src_vmapped) {
-    int max_dims = 0;
-    for (auto& idx : indices) {
-      max_dims = std::max(static_cast<int>(idx.ndim()), max_dims);
-    }
-    auto new_ax_loc =
-        std::find_if(gather_axes.begin(), gather_axes.end(), [&out_ax](int a) {
-          return a >= out_ax;
-        });
-    for (; new_ax_loc < gather_axes.end(); new_ax_loc++) {
-      (*new_ax_loc)++;
+    for (auto& ax : gather_axes) {
+      if (ax >= axes[0]) {
+        ax++;
+      }
     }
     if (indices_vmapped) {
       // Make a new index array for the vmapped dimension
+      auto vmap_inds = arange(0, src.shape(axes[0]), stream());
       // Reshape it so it broadcasts with other index arrays
+      {
+        auto shape = std::vector<int>(idx_dims, 1);
+        shape[out_ax] = vmap_inds.size();
+        vmap_inds = reshape(vmap_inds, std::move(shape), stream());
+      }
       // Update gather axes and slice sizes accordingly
-      auto shape = std::vector<int>(max_dims - out_ax, 1);
-      auto vmap_inds = arange(0, src.shape(out_ax), stream());
-      shape[0] = vmap_inds.shape(0);
-      vmap_inds = reshape(vmap_inds, shape, stream());
-      slice_sizes.insert(slice_sizes.begin() + out_ax, 1);
-      auto new_ax_idx = new_ax_loc - gather_axes.begin();
-      gather_axes.insert(new_ax_loc, out_ax);
-      indices.insert(indices.begin() + new_ax_idx, vmap_inds);
+      slice_sizes.insert(slice_sizes.begin() + axes[0], 1);
+      gather_axes.push_back(axes[0]);
+      indices.push_back(vmap_inds);
     } else {
-      slice_sizes.insert(slice_sizes.begin() + axes[0], src.shape(axes[0]));
-      out_ax = max_dims + axes[0];
+      slice_sizes.insert(slice_sizes.begin() + out_ax, src.shape(out_ax));
+      out_ax += idx_dims;
     }
   }
-  return {{gather(src, indices, gather_axes, slice_sizes, stream())}, {out_ax}};
+  auto out = gather(src, indices, gather_axes, slice_sizes, stream());
+  if (src_vmapped && indices_vmapped) {
+    out = squeeze(out, idx_dims + axes[0], stream());
+  }
+  return {{out}, {out_ax}};
 }
 
 std::vector<array> Gather::vjp(
@@ -1782,6 +1863,36 @@ std::vector<array> GreaterEqual::jvp(
     const std::vector<int>& argnums) {
   auto shape = broadcast_shapes(primals[0].shape(), primals[1].shape());
   return {zeros(shape, bool_, stream())};
+}
+
+std::vector<array> Imag::vjp(
+    const std::vector<array>& primals,
+    const std::vector<array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<array>&) {
+  assert(primals.size() == 1);
+  assert(argnums.size() == 1);
+  return {multiply(
+      array(complex64_t{0.0f, -1.0f}, primals[0].dtype()),
+      cotangents[0],
+      stream())};
+}
+
+std::vector<array> Imag::jvp(
+    const std::vector<array>& primals,
+    const std::vector<array>& tangents,
+    const std::vector<int>& argnums) {
+  assert(primals.size() == 1);
+  assert(argnums.size() == 1);
+  return {imag(tangents[0], stream())};
+}
+
+std::pair<std::vector<array>, std::vector<int>> Imag::vmap(
+    const std::vector<array>& inputs,
+    const std::vector<int>& axes) {
+  assert(inputs.size() == 1);
+  assert(axes.size() == 1);
+  return {{imag(inputs[0], stream())}, axes};
 }
 
 std::pair<std::vector<array>, std::vector<int>> Less::vmap(
@@ -2618,6 +2729,33 @@ std::pair<std::vector<array>, std::vector<int>> RandomBits::vmap(
 bool RandomBits::is_equivalent(const Primitive& other) const {
   const RandomBits& r_other = static_cast<const RandomBits&>(other);
   return shape_ == r_other.shape_;
+}
+
+std::vector<array> Real::vjp(
+    const std::vector<array>& primals,
+    const std::vector<array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<array>&) {
+  assert(primals.size() == 1);
+  assert(argnums.size() == 1);
+  return {astype(cotangents[0], primals[0].dtype(), stream())};
+}
+
+std::vector<array> Real::jvp(
+    const std::vector<array>& primals,
+    const std::vector<array>& tangents,
+    const std::vector<int>& argnums) {
+  assert(primals.size() == 1);
+  assert(argnums.size() == 1);
+  return {real(tangents[0], stream())};
+}
+
+std::pair<std::vector<array>, std::vector<int>> Real::vmap(
+    const std::vector<array>& inputs,
+    const std::vector<int>& axes) {
+  assert(inputs.size() == 1);
+  assert(axes.size() == 1);
+  return {{real(inputs[0], stream())}, axes};
 }
 
 std::pair<std::vector<array>, std::vector<int>> Reshape::vmap(

@@ -159,6 +159,17 @@ void Conjugate::eval(const std::vector<array>& inputs, array& out) {
   }
 }
 
+void Contiguous::eval_cpu(const std::vector<array>& inputs, array& out) {
+  assert(inputs.size() == 1);
+  auto& in = inputs[0];
+  if (in.flags().row_contiguous ||
+      (allow_col_major_ && in.flags().col_contiguous)) {
+    out.copy_shared_buffer(in);
+  } else {
+    copy(in, out, CopyType::General);
+  }
+}
+
 void Cos::eval(const std::vector<array>& inputs, array& out) {
   assert(inputs.size() == 1);
   const auto& in = inputs[0];
@@ -271,6 +282,10 @@ void Full::eval(const std::vector<array>& inputs, array& out) {
     ctype = CopyType::General;
   }
   copy(in, out, ctype);
+}
+
+void Imag::eval_cpu(const std::vector<array>& inputs, array& out) {
+  unary_op<complex64_t, float>(inputs[0], out, detail::Imag());
 }
 
 void Log::eval(const std::vector<array>& inputs, array& out) {
@@ -396,6 +411,10 @@ void RandomBits::eval(const std::vector<array>& inputs, array& out) {
       ptr[half_size] = random::threefry2x32_hash(key, count).first;
     }
   }
+}
+
+void Real::eval_cpu(const std::vector<array>& inputs, array& out) {
+  unary_op<complex64_t, float>(inputs[0], out, detail::Real());
 }
 
 void Reshape::eval(const std::vector<array>& inputs, array& out) {
@@ -598,7 +617,7 @@ void View::eval_cpu(const std::vector<array>& inputs, array& out) {
   if (ibytes == obytes || obytes < ibytes && in.strides().back() == 1 ||
       in.flags().row_contiguous) {
     auto strides = in.strides();
-    for (int i = 0; i < strides.size() - 1; ++i) {
+    for (int i = 0; i < static_cast<int>(strides.size()) - 1; ++i) {
       strides[i] *= ibytes;
       strides[i] /= obytes;
     }

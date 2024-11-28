@@ -1,5 +1,4 @@
 // Copyright © 2024 Apple Inc.
-
 #include "mlx/backend/common/binary.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels.h"
@@ -23,37 +22,37 @@ std::string get_kernel_name(
     BinaryOpType bopt,
     const std::string& op,
     const array& a,
-    bool use_2d,
+    bool large,
     int ndim,
     int work_per_thread) {
-  std::ostringstream kname;
+  std::string kname;
   switch (bopt) {
     case BinaryOpType::ScalarScalar:
-      kname << "ss";
+      kname = "ss";
       break;
     case BinaryOpType::ScalarVector:
-      kname << (use_2d ? "sv2" : "sv");
+      kname = (large ? "sv2" : "sv");
       break;
     case BinaryOpType::VectorScalar:
-      kname << (use_2d ? "vs2" : "vs");
+      kname = (large ? "vs2" : "vs");
       break;
     case BinaryOpType::VectorVector:
-      kname << (use_2d ? "vv2" : "vv");
+      kname = (large ? "vv2" : "vv");
       break;
     case BinaryOpType::General:
-      kname << "g";
+      kname = "g";
       if (ndim <= 3) {
-        kname << ndim;
+        kname += std::to_string(ndim);
       } else {
-        kname << "n";
-        if (work_per_thread > 1) {
-          kname << work_per_thread;
-        }
+        concatenate(kname, "n", std::to_string(work_per_thread));
+      }
+      if (large) {
+        kname += "large";
       }
       break;
   }
-  kname << "_" << op << type_to_name(a);
-  return kname.str();
+  concatenate(kname, "_", op, type_to_name(a));
+  return kname;
 }
 
 void binary_op_gpu_inplace(
@@ -82,19 +81,24 @@ void binary_op_gpu_inplace(
   };
   auto [shape, strides_a, strides_b, strides_out] = maybe_collapse();
 
-  bool use_2d = out.data_size() > UINT32_MAX;
+  bool large = out.data_size() > UINT32_MAX;
   auto ndim = shape.size();
-  int work_per_thread =
-      (bopt == BinaryOpType::General && shape[ndim - 1] > 4) ? 4 : 1;
+  int work_per_thread;
+  if (bopt == BinaryOpType::General) {
+    large |= (a.data_size() > UINT32_MAX || b.data_size() > UINT32_MAX);
+    work_per_thread = large ? 4 : 2;
+  } else {
+    work_per_thread = 1;
+  }
   std::string kernel_name =
-      get_kernel_name(bopt, op, a, use_2d, shape.size(), work_per_thread);
+      get_kernel_name(bopt, op, a, large, shape.size(), work_per_thread);
   auto& d = metal::device(s.device);
 
   auto kernel = outputs.size() == 2
       ? get_binary_two_kernel(d, kernel_name, a.dtype(), out.dtype(), op)
       : get_binary_kernel(d, kernel_name, a.dtype(), out.dtype(), op);
   auto& compute_encoder = d.get_command_encoder(s.index);
-  compute_encoder->setComputePipelineState(kernel);
+  compute_encoder.set_compute_pipeline_state(kernel);
 
   // - If a is donated it goes to the first output
   // - If b is donated it goes to the first output if a was not donated
@@ -111,6 +115,7 @@ void binary_op_gpu_inplace(
     compute_encoder.set_output_array(outputs[1], arg_idx++);
   }
 
+  auto thread_group_size = kernel->maxTotalThreadsPerThreadgroup();
   if (bopt == BinaryOpType::General) {
     // Launch up to 3D grid of threads
     size_t dim0 = ndim > 0 ? shape[ndim - 1] : 1;
@@ -118,39 +123,33 @@ void binary_op_gpu_inplace(
     size_t rest = out.size() / (dim0 * dim1);
 
     if (ndim > 3) {
-      compute_encoder->setBytes(shape.data(), ndim * sizeof(int), arg_idx++);
-      compute_encoder->setBytes(
-          strides_a.data(), ndim * sizeof(size_t), arg_idx++);
-      compute_encoder->setBytes(
-          strides_b.data(), ndim * sizeof(size_t), arg_idx++);
-      compute_encoder->setBytes(&ndim, sizeof(int), arg_idx++);
+      compute_encoder.set_vector_bytes(shape, arg_idx++);
+      compute_encoder.set_vector_bytes(strides_a, arg_idx++);
+      compute_encoder.set_vector_bytes(strides_b, arg_idx++);
+      compute_encoder.set_bytes<int>(ndim, arg_idx++);
       dim0 = (dim0 + work_per_thread - 1) / work_per_thread;
     } else {
       // The shape is implicit in the grid for <= 3D
-      compute_encoder->setBytes(
-          strides_a.data(), ndim * sizeof(size_t), arg_idx++);
-      compute_encoder->setBytes(
-          strides_b.data(), ndim * sizeof(size_t), arg_idx++);
+      compute_encoder.set_vector_bytes(strides_a, arg_idx++);
+      compute_encoder.set_vector_bytes(strides_b, arg_idx++);
     }
 
-    NS::UInteger thread_group_size = kernel->maxTotalThreadsPerThreadgroup();
     if (thread_group_size != 1024) {
       throw std::runtime_error("[Metal::binary] Must use 1024 sized block");
     }
     auto group_dims = get_block_dims(dim0, dim1, rest);
     MTL::Size grid_dims = MTL::Size(dim0, dim1, rest);
-    compute_encoder.dispatchThreads(grid_dims, group_dims);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
   } else {
     // Launch a 1D or 2D grid of threads
     size_t nthreads = out.data_size();
-    MTL::Size grid_dims = use_2d ? get_2d_grid_dims(out.shape(), out.strides())
-                                 : MTL::Size(nthreads, 1, 1);
-    NS::UInteger thread_group_size = kernel->maxTotalThreadsPerThreadgroup();
     if (thread_group_size > nthreads) {
       thread_group_size = nthreads;
     }
     MTL::Size group_dims = MTL::Size(thread_group_size, 1, 1);
-    compute_encoder.dispatchThreads(grid_dims, group_dims);
+    MTL::Size grid_dims = large ? get_2d_grid_dims(out.shape(), out.strides())
+                                : MTL::Size(nthreads, 1, 1);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
   }
 }
 

@@ -846,6 +846,23 @@ void init_array(nb::module_& m) {
       .def("__int__", [](array& a) { return nb::int_(to_scalar(a)); })
       .def("__float__", [](array& a) { return nb::float_(to_scalar(a)); })
       .def(
+          "__format__",
+          [](array& a, nb::object format_spec) {
+            if (nb::len(nb::str(format_spec)) > 0 && a.ndim() > 0) {
+              throw nb::type_error(
+                  "unsupported format string passed to mx.array.__format__");
+            } else if (a.ndim() == 0) {
+              auto obj = to_scalar(a);
+              return nb::cast<std::string>(
+                  nb::handle(PyObject_Format(obj.ptr(), format_spec.ptr())));
+            } else {
+              nb::gil_scoped_release nogil;
+              std::ostringstream os;
+              os << a;
+              return os.str();
+            }
+          })
+      .def(
           "flatten",
           [](const array& a,
              int start_axis,

@@ -14,20 +14,27 @@ function(make_jit_source SRC_FILE)
     COMMAND
       /bin/bash ${CMAKE_CURRENT_SOURCE_DIR}/make_compiled_preamble.sh
       ${CMAKE_CURRENT_BINARY_DIR}/jit ${CMAKE_C_COMPILER} ${PROJECT_SOURCE_DIR}
-      ${SRC_FILE} "-DMLX_METAL_VERSION=${MLX_METAL_VERSION}"
+      ${SRC_FILE}
     DEPENDS make_compiled_preamble.sh kernels/${SRC_FILE}.h ${ARGN})
   add_custom_target(${SRC_NAME} DEPENDS jit/${SRC_NAME}.cpp)
   add_dependencies(mlx ${SRC_NAME})
   target_sources(mlx PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/jit/${SRC_NAME}.cpp)
 endfunction(make_jit_source)
 
-make_jit_source(utils kernels/bf16.h kernels/complex.h kernels/defines.h)
+make_jit_source(
+  utils
+  kernels/jit/bf16.h
+  kernels/metal_3_0/bf16.h
+  kernels/metal_3_1/bf16.h
+  kernels/bf16_math.h
+  kernels/complex.h
+  kernels/defines.h)
 make_jit_source(unary_ops kernels/erf.h kernels/expm1f.h)
 make_jit_source(binary_ops)
 make_jit_source(ternary_ops)
 make_jit_source(reduce_utils kernels/atomic.h kernels/reduction/ops.h)
-make_jit_source(scatter)
-make_jit_source(gather)
+make_jit_source(scatter kernels/indexing.h)
+make_jit_source(gather kernels/indexing.h)
 make_jit_source(hadamard)
 
 if(MLX_METAL_JIT)
@@ -99,6 +106,7 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/reduce.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/ternary.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/unary.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/resident.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp)
 
 if(NOT MLX_METAL_PATH)

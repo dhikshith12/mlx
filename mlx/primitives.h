@@ -639,6 +639,25 @@ class Conjugate : public UnaryPrimitive {
   void eval(const std::vector<array>& inputs, array& out);
 };
 
+class Contiguous : public UnaryPrimitive {
+ public:
+  explicit Contiguous(Stream stream, bool allow_col_major)
+      : UnaryPrimitive(stream), allow_col_major_(allow_col_major) {}
+
+  void eval_cpu(const std::vector<array>& inputs, array& out) override;
+  void eval_gpu(const std::vector<array>& inputs, array& out) override;
+
+  DEFINE_VMAP()
+  DEFINE_GRADS()
+  DEFINE_PRINT(Contiguous)
+  DEFINE_INPUT_OUTPUT_SHAPE()
+
+  bool is_equivalent(const Primitive& other) const override;
+
+ private:
+  bool allow_col_major_;
+};
+
 class Convolution : public UnaryPrimitive {
  public:
   explicit Convolution(
@@ -1106,6 +1125,20 @@ class Hadamard : public UnaryPrimitive {
   void eval(const std::vector<array>& inputs, array& out);
 };
 
+class Imag : public UnaryPrimitive {
+ public:
+  explicit Imag(Stream stream) : UnaryPrimitive(stream) {}
+
+  void eval_cpu(const std::vector<array>& inputs, array& out) override;
+  void eval_gpu(const std::vector<array>& inputs, array& out) override;
+
+  DEFINE_VMAP()
+  DEFINE_GRADS()
+  DEFINE_PRINT(Imag)
+  DEFINE_DEFAULT_IS_EQUIVALENT()
+  DEFINE_INPUT_OUTPUT_SHAPE()
+};
+
 class Less : public UnaryPrimitive {
  public:
   explicit Less(Stream stream) : UnaryPrimitive(stream) {}
@@ -1559,6 +1592,20 @@ class RandomBits : public UnaryPrimitive {
   int width_;
 
   void eval(const std::vector<array>& inputs, array& out);
+};
+
+class Real : public UnaryPrimitive {
+ public:
+  explicit Real(Stream stream) : UnaryPrimitive(stream) {}
+
+  void eval_cpu(const std::vector<array>& inputs, array& out) override;
+  void eval_gpu(const std::vector<array>& inputs, array& out) override;
+
+  DEFINE_VMAP()
+  DEFINE_GRADS()
+  DEFINE_PRINT(Real)
+  DEFINE_DEFAULT_IS_EQUIVALENT()
+  DEFINE_INPUT_OUTPUT_SHAPE()
 };
 
 class Reshape : public UnaryPrimitive {
@@ -2166,6 +2213,46 @@ class Cholesky : public UnaryPrimitive {
  private:
   void eval(const std::vector<array>& inputs, array& output);
   bool upper_;
+};
+
+class Eigh : public Primitive {
+ public:
+  explicit Eigh(Stream stream, std::string uplo, bool compute_eigenvectors)
+      : Primitive(stream),
+        uplo_(std::move(uplo)),
+        compute_eigenvectors_(compute_eigenvectors) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_VMAP()
+  DEFINE_PRINT(Eigh)
+
+  std::vector<std::vector<int>> output_shapes(
+      const std::vector<array>& inputs) override {
+    auto shape = inputs[0].shape();
+    shape.pop_back(); // Remove last dimension for eigenvalues
+    if (compute_eigenvectors_) {
+      return {shape, inputs[0].shape()}; // Eigenvalues and eigenvectors
+    } else {
+      return {shape}; // Only eigenvalues
+    }
+  }
+
+  bool is_equivalent(const Primitive& other) const override {
+    if (auto* p = dynamic_cast<const Eigh*>(&other)) {
+      return uplo_ == p->uplo_ &&
+          compute_eigenvectors_ == p->compute_eigenvectors_;
+    }
+    return false;
+  }
+
+ private:
+  void eval(const std::vector<array>& inputs, std::vector<array>& outputs);
+  std::string uplo_;
+  bool compute_eigenvectors_;
 };
 
 } // namespace mlx::core

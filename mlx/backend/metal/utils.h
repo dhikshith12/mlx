@@ -8,30 +8,14 @@
 
 namespace mlx::core {
 
-using metal::CommandEncoder;
-
-template <typename T>
-inline void set_vector_bytes(
-    CommandEncoder& enc,
-    const std::vector<T>& vec,
-    size_t nelems,
-    int idx) {
-  enc->setBytes(vec.data(), nelems * sizeof(T), idx);
-}
-
-template <typename T>
-inline void
-set_vector_bytes(CommandEncoder& enc, const std::vector<T>& vec, int idx) {
-  return set_vector_bytes(enc, vec, vec.size(), idx);
-}
-
+std::string type_to_name(const Dtype& t);
 std::string type_to_name(const array& a);
 
 // Compute the thread block dimensions which fit the given
 // input dimensions.
 // - The thread block dimensions will be powers of two
-// - The thread block size will be less than 1024
-MTL::Size get_block_dims(int dim0, int dim1, int dim2);
+// - The thread block size will be less than 2^pow2
+MTL::Size get_block_dims(int dim0, int dim1, int dim2, int pow2 = 10);
 
 // Computes a 2D grid where each element is < UINT_MAX
 // Assumes:
@@ -41,6 +25,14 @@ MTL::Size get_block_dims(int dim0, int dim1, int dim2);
 MTL::Size get_2d_grid_dims(
     const std::vector<int>& shape,
     const std::vector<size_t>& strides);
+
+// Same as above but we do an implicit division with divisor.
+// Basically, equivalent to factorizing
+//    Prod(s \forall s in shape if strides[s] > 0) / divisor.
+MTL::Size get_2d_grid_dims(
+    const std::vector<int>& shape,
+    const std::vector<size_t>& strides,
+    size_t divisor);
 
 inline NS::String* make_string(std::ostringstream& os) {
   std::string string = os.str();
@@ -69,5 +61,16 @@ inline void debug_set_primitive_buffer_label(
 }
 
 std::string get_primitive_string(Primitive* primitive);
+
+template <typename T>
+void concatenate(std::string& acc, T first) {
+  acc += first;
+}
+
+template <typename T, typename... Args>
+void concatenate(std::string& acc, T first, Args... args) {
+  acc += first;
+  concatenate(acc, args...);
+}
 
 } // namespace mlx::core

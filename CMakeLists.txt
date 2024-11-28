@@ -14,7 +14,7 @@ option(MLX_BUILD_TESTS "Build tests for mlx" ON)
 option(MLX_BUILD_EXAMPLES "Build examples for mlx" ON)
 option(MLX_BUILD_BENCHMARKS "Build benchmarks for mlx" OFF)
 option(MLX_BUILD_PYTHON_BINDINGS "Build python bindings for mlx" OFF)
-option(MLX_BUILD_METAL "Build metal backend" OFF)
+option(MLX_BUILD_METAL "Build metal backend" ON)
 option(MLX_BUILD_CPU "Build cpu backend" ON)
 option(MLX_METAL_DEBUG "Enhance metal debug workflow" OFF)
 option(MLX_ENABLE_X64_MAC "Enable building for x64 macOS" OFF)
@@ -24,7 +24,7 @@ option(MLX_METAL_JIT "Use JIT compilation for Metal kernels" OFF)
 option(BUILD_SHARED_LIBS "Build mlx as a shared library" OFF)
 
 if(NOT MLX_VERSION)
-  set(MLX_VERSION 0.18.0)
+  set(MLX_VERSION 0.21.0)
 endif()
 
 # --------------------- Processor tests -------------------------
@@ -47,13 +47,13 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
           "https://ml-explore.github.io/mlx/build/html/install.html#build-from-source"
       )
     else()
+      set(MLX_BUILD_METAL OFF)
       message(WARNING "Building for x86_64 arch is not officially supported.")
     endif()
-  elseif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "arm64")
-    set(MLX_BUILD_METAL ON)
   endif()
 
 else()
+  set(MLX_BUILD_METAL OFF)
   message(WARNING "MLX is prioritised for Apple silicon systems using macOS.")
 endif()
 
@@ -89,25 +89,27 @@ elseif(MLX_BUILD_METAL)
   # Throw an error if xcrun not found
   execute_process(
     COMMAND zsh "-c" "/usr/bin/xcrun -sdk macosx --show-sdk-version"
-    OUTPUT_VARIABLE MACOS_VERSION COMMAND_ERROR_IS_FATAL ANY)
+    OUTPUT_VARIABLE MACOS_SDK_VERSION COMMAND_ERROR_IS_FATAL ANY)
 
-  if(${MACOS_VERSION} LESS 14.0)
+  if(${MACOS_SDK_VERSION} LESS 14.0)
     message(
       FATAL_ERROR
         "MLX requires macOS SDK >= 14.0 to be built with MLX_BUILD_METAL=ON")
   endif()
-  message(STATUS "Building with SDK for macOS version ${MACOS_VERSION}")
+  message(STATUS "Building with macOS SDK version ${MACOS_SDK_VERSION}")
 
   set(METAL_CPP_URL
       https://developer.apple.com/metal/cpp/files/metal-cpp_macOS15_iOS18-beta.zip
   )
-  # Get the metal version
+
+  if(NOT CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
+    set(XCRUN_FLAGS "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+  endif()
   execute_process(
     COMMAND
       zsh "-c"
-      "echo \"__METAL_VERSION__\" | xcrun -sdk macosx metal -E -x metal -P - | tail -1 | tr -d '\n'"
+      "echo \"__METAL_VERSION__\" | xcrun -sdk macosx metal ${XCRUN_FLAGS} -E -x metal -P - | tail -1 | tr -d '\n'"
     OUTPUT_VARIABLE MLX_METAL_VERSION COMMAND_ERROR_IS_FATAL ANY)
-
   FetchContent_Declare(metal_cpp URL ${METAL_CPP_URL})
 
   FetchContent_MakeAvailable(metal_cpp)
@@ -115,8 +117,6 @@ elseif(MLX_BUILD_METAL)
     mlx PUBLIC $<BUILD_INTERFACE:${metal_cpp_SOURCE_DIR}>
                $<INSTALL_INTERFACE:include/metal_cpp>)
   target_link_libraries(mlx PUBLIC ${METAL_LIB} ${FOUNDATION_LIB} ${QUARTZ_LIB})
-
-  add_compile_definitions("MLX_METAL_VERSION=${MLX_METAL_VERSION}")
 endif()
 
 if(MLX_BUILD_CPU)
@@ -160,6 +160,13 @@ if(MLX_BUILD_CPU)
     message(STATUS "Blas include " ${BLAS_INCLUDE_DIRS})
     target_include_directories(mlx PRIVATE ${BLAS_INCLUDE_DIRS})
     target_link_libraries(mlx PUBLIC ${BLAS_LIBRARIES})
+
+    if(WIN32)
+      find_package(dlfcn-win32 REQUIRED)
+      message(STATUS "dlfcn-win32 lib " ${dlfcn-win32_LIBRARIES})
+      message(STATUS "dlfcn-win32 include " ${dlfcn-win32_INCLUDE_DIRS})
+      target_link_libraries(mlx PUBLIC ${dlfcn-win32_LIBRARIES})
+    endif()
   endif()
 else()
   set(MLX_BUILD_ACCELERATE OFF)

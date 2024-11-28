@@ -1402,10 +1402,16 @@ array isnan(const array& a, StreamOrDevice s /* = {} */) {
 }
 
 array isinf(const array& a, StreamOrDevice s /* = {} */) {
+  if (issubdtype(a.dtype(), integer) || a.dtype() == bool_) {
+    return full(a.shape(), false, bool_, s);
+  }
   return logical_or(isposinf(a, s), isneginf(a, s), s);
 }
 
 array isfinite(const array& a, StreamOrDevice s /* = {} */) {
+  if (issubdtype(a.dtype(), integer) || a.dtype() == bool_) {
+    return full(a.shape(), true, bool_, s);
+  }
   return logical_not(logical_or(isinf(a, s), isnan(a, s), s), s);
 }
 
@@ -1497,10 +1503,17 @@ array isclose(
   auto out = less_equal(lhs, rhs, s);
 
   // Correct the result for infinite values.
-  auto any_inf = logical_or(isinf(a, s), isinf(b, s), s);
+  auto a_pos_inf = isposinf(a, s);
+  auto b_pos_inf = isposinf(b, s);
+  auto a_neg_inf = isneginf(a, s);
+  auto b_neg_inf = isneginf(b, s);
+  auto any_inf = logical_or(
+      logical_or(a_pos_inf, a_neg_inf, s),
+      logical_or(b_pos_inf, b_neg_inf, s),
+      s);
   auto both_inf = logical_or(
-      logical_and(isposinf(a, s), isposinf(b, s), s),
-      logical_and(isneginf(a, s), isneginf(b, s), s),
+      logical_and(a_pos_inf, b_pos_inf, s),
+      logical_and(a_neg_inf, b_neg_inf, s),
       s);
 
   // Convert all elements where either value is infinite to False.
@@ -1602,7 +1615,14 @@ array sum(
   }
   auto [out_shape, sorted_axes, squeezed_shape, is_noop] =
       compute_reduce_shape(axes, a.shape());
-  auto out_type = a.dtype() == bool_ ? int32 : a.dtype();
+  Dtype out_type = a.dtype();
+  if (issubdtype(a.dtype(), signedinteger)) {
+    out_type = a.dtype().size() <= 4 ? int32 : int64;
+  } else if (issubdtype(a.dtype(), unsignedinteger)) {
+    out_type = a.dtype().size() <= 4 ? uint32 : uint64;
+  } else if (a.dtype() == bool_) {
+    out_type = int32;
+  }
   auto out = (is_noop)
       ? astype(a, out_type, s)
       : array(
@@ -1747,11 +1767,19 @@ array prod(
   }
   auto [out_shape, sorted_axes, squeezed_shape, is_noop] =
       compute_reduce_shape(axes, a.shape());
+  Dtype out_type = a.dtype();
+  if (issubdtype(a.dtype(), signedinteger)) {
+    out_type = a.dtype().size() <= 4 ? int32 : int64;
+  } else if (issubdtype(a.dtype(), unsignedinteger)) {
+    out_type = a.dtype().size() <= 4 ? uint32 : uint64;
+  } else if (a.dtype() == bool_) {
+    out_type = int32;
+  }
   auto out = (is_noop)
       ? a
       : array(
             std::move(out_shape),
-            a.dtype(),
+            out_type,
             std::make_shared<Reduce>(to_stream(s), Reduce::Prod, sorted_axes),
             {a});
   if (!keepdims) {
@@ -3592,10 +3620,10 @@ array conv_general(
 }
 
 array quantized_matmul(
-    const array& x,
-    const array& w,
-    const array& scales,
-    const array& biases,
+    array x,
+    array w,
+    array scales,
+    array biases,
     bool transpose /* = true */,
     int group_size /* = 64 */,
     int bits /* = 4 */,
@@ -3604,11 +3632,27 @@ array quantized_matmul(
   auto [w_inner_dims, w_outer_dims] = extract_quantized_matmul_dims(
       "quantized_matmul", x, w, scales, biases, transpose, group_size, bits);
 
-  if (w.ndim() != 2) {
-    std::ostringstream msg;
-    msg << "[quantized_matmul] Batched quantized matmul is not supported for now "
-        << "received w with shape " << w.shape();
-    throw std::invalid_argument(msg.str());
+  // QuantizedMatmul handles w.ndim == 2 case.
+  if (x.ndim() > 2 && w.ndim() > 2) {
+    std::vector<int> bsx_x(x.shape().begin(), x.shape().end() - 2);
+    std::vector<int> bsx_w(w.shape().begin(), w.shape().end() - 2);
+    auto inner_shape = broadcast_shapes(bsx_x, bsx_w);
+
+    // Broadcast x
+    inner_shape.push_back(x.shape(-2));
+    inner_shape.push_back(x.shape(-1));
+    x = broadcast_to(x, inner_shape, s);
+
+    // Broadcast w
+    *(inner_shape.end() - 2) = w.shape(-2);
+    *(inner_shape.end() - 1) = w.shape(-1);
+    w = broadcast_to(w, inner_shape, s);
+
+    *(inner_shape.end() - 1) = scales.shape(-1);
+    scales = broadcast_to(scales, inner_shape, s);
+
+    *(inner_shape.end() - 1) = biases.shape(-1);
+    biases = broadcast_to(biases, inner_shape, s);
   }
 
   auto dtype = result_type(x, scales, biases);
@@ -3639,7 +3683,7 @@ std::tuple<array, array, array> quantize(
     int group_size /* = 64 */,
     int bits /* = 4 */,
     StreamOrDevice s /* = {} */) {
-  return fast::affine_quantize(w, group_size, bits);
+  return fast::affine_quantize(w, group_size, bits, s);
 }
 
 array dequantize(
@@ -4558,13 +4602,128 @@ array view(const array& a, const Dtype& dtype, StreamOrDevice s /* = {} */) {
             " axis must be a multiple of the requested type size.");
       }
       out_shape.back() /= (obytes / ibytes);
-    } else {
+    } else if (ibytes > obytes) {
       // Type size ratios are always integers
       out_shape.back() *= (ibytes / obytes);
     }
   }
   return array(
       out_shape, dtype, std::make_shared<View>(to_stream(s), dtype), {a});
+}
+
+array roll(
+    const array& a,
+    const std::vector<int>& shift,
+    const std::vector<int>& axes,
+    StreamOrDevice s /* = {} */) {
+  if (axes.empty()) {
+    return a;
+  }
+
+  if (shift.size() < axes.size()) {
+    std::ostringstream msg;
+    msg << "[roll] At least one shift value per axis is required, "
+        << shift.size() << " provided for " << axes.size() << " axes.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  std::vector<array> parts;
+  array result = a;
+  for (int i = 0; i < axes.size(); i++) {
+    int ax = axes[i];
+    if (ax < 0) {
+      ax += a.ndim();
+    }
+    if (ax < 0 || ax >= a.ndim()) {
+      std::ostringstream msg;
+      msg << "[roll] Invalid axis " << axes[i] << " for array with " << a.ndim()
+          << " dimensions.";
+      throw std::invalid_argument(msg.str());
+    }
+
+    int sh = shift[i];
+    int split_index =
+        (sh < 0) ? (-sh) % a.shape(ax) : a.shape(ax) - sh % a.shape(ax);
+
+    parts = split(result, std::vector<int>{split_index}, ax, s);
+    std::swap(parts[0], parts[1]);
+    result = concatenate(parts, ax, s);
+  }
+
+  return result;
+}
+
+array roll(const array& a, int shift, StreamOrDevice s /* = {} */) {
+  auto shape = a.shape();
+  return reshape(
+      roll(
+          reshape(a, std::vector<int>{-1}, s),
+          std::vector<int>{shift},
+          std::vector<int>{0},
+          s),
+      std::move(shape),
+      s);
+}
+
+array roll(
+    const array& a,
+    const std::vector<int>& shift,
+    StreamOrDevice s /* = {} */) {
+  int total_shift = 0;
+  for (auto& s : shift) {
+    total_shift += s;
+  }
+  return roll(a, total_shift, s);
+}
+
+array roll(const array& a, int shift, int axis, StreamOrDevice s /* = {} */) {
+  return roll(a, std::vector<int>{shift}, std::vector<int>{axis}, s);
+}
+
+array roll(
+    const array& a,
+    int shift,
+    const std::vector<int>& axes,
+    StreamOrDevice s /* = {} */) {
+  std::vector<int> shifts(axes.size(), shift);
+  return roll(a, shifts, axes, s);
+}
+
+array roll(
+    const array& a,
+    const std::vector<int>& shift,
+    int axis,
+    StreamOrDevice s /* = {} */) {
+  int total_shift = 0;
+  for (auto& s : shift) {
+    total_shift += s;
+  }
+  return roll(a, std::vector<int>{total_shift}, std::vector<int>{axis}, s);
+}
+
+array real(const array& a, StreamOrDevice s /* = {} */) {
+  if (!issubdtype(a.dtype(), complexfloating)) {
+    return a;
+  }
+  return array(a.shape(), float32, std::make_shared<Real>(to_stream(s)), {a});
+}
+
+array imag(const array& a, StreamOrDevice s /* = {} */) {
+  if (!issubdtype(a.dtype(), complexfloating)) {
+    return zeros_like(a);
+  }
+  return array(a.shape(), float32, std::make_shared<Imag>(to_stream(s)), {a});
+}
+
+array contiguous(
+    const array& a,
+    bool allow_col_major /* = false */,
+    StreamOrDevice s /* = {} */) {
+  return array(
+      a.shape(),
+      a.dtype(),
+      std::make_shared<Contiguous>(to_stream(s), allow_col_major),
+      {a});
 }
 
 } // namespace mlx::core

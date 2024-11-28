@@ -575,8 +575,7 @@ void fft_op(
   auto plan = plan_fft(n);
   if (plan.four_step) {
     four_step_fft(in, out, axis, inverse, real, plan, copies, s);
-    d.get_command_buffer(s.index)->addCompletedHandler(
-        [copies](MTL::CommandBuffer*) mutable { copies.clear(); });
+    d.add_temporaries(std::move(copies), s.index);
     return;
   }
 
@@ -700,7 +699,7 @@ void fft_op(
     auto kernel =
         get_fft_kernel(d, base_name, hash_name, func_consts, template_def);
 
-    compute_encoder->setComputePipelineState(kernel);
+    compute_encoder.set_compute_pipeline_state(kernel);
     compute_encoder.set_input_array(in_contiguous, 0);
     compute_encoder.set_output_array(out, 1);
 
@@ -712,9 +711,9 @@ void fft_op(
 
       compute_encoder.set_input_array(w_q, 2); // w_q
       compute_encoder.set_input_array(w_k, 3); // w_k
-      compute_encoder->setBytes(&n, sizeof(int), 4);
-      compute_encoder->setBytes(&plan.bluestein_n, sizeof(int), 5);
-      compute_encoder->setBytes(&total_batch_size, sizeof(int), 6);
+      compute_encoder.set_bytes(n, 4);
+      compute_encoder.set_bytes(plan.bluestein_n, 5);
+      compute_encoder.set_bytes(total_batch_size, 6);
     } else if (plan.rader_n > 1) {
       auto [b_q, g_q, g_minus_q] = compute_raders_constants(plan.rader_n, s);
       copies.push_back(b_q);
@@ -724,25 +723,25 @@ void fft_op(
       compute_encoder.set_input_array(b_q, 2);
       compute_encoder.set_input_array(g_q, 3);
       compute_encoder.set_input_array(g_minus_q, 4);
-      compute_encoder->setBytes(&n, sizeof(int), 5);
-      compute_encoder->setBytes(&total_batch_size, sizeof(int), 6);
-      compute_encoder->setBytes(&plan.rader_n, sizeof(int), 7);
+      compute_encoder.set_bytes(n, 5);
+      compute_encoder.set_bytes(total_batch_size, 6);
+      compute_encoder.set_bytes(plan.rader_n, 7);
     } else if (four_step_params.required) {
-      compute_encoder->setBytes(&four_step_params.n1, sizeof(int), 2);
-      compute_encoder->setBytes(&four_step_params.n2, sizeof(int), 3);
-      compute_encoder->setBytes(&total_batch_size, sizeof(int), 4);
+      compute_encoder.set_bytes(four_step_params.n1, 2);
+      compute_encoder.set_bytes(four_step_params.n2, 3);
+      compute_encoder.set_bytes(total_batch_size, 4);
     } else {
-      compute_encoder->setBytes(&n, sizeof(int), 2);
-      compute_encoder->setBytes(&total_batch_size, sizeof(int), 3);
+      compute_encoder.set_bytes(n, 2);
+      compute_encoder.set_bytes(total_batch_size, 3);
     }
 
     auto group_dims = MTL::Size(1, threadgroup_batch_size, threads_per_fft);
     auto grid_dims =
         MTL::Size(batch_size, threadgroup_batch_size, threads_per_fft);
-    compute_encoder->dispatchThreads(grid_dims, group_dims);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
   }
-  d.get_command_buffer(s.index)->addCompletedHandler(
-      [copies](MTL::CommandBuffer*) mutable { copies.clear(); });
+
+  d.add_temporaries(std::move(copies), s.index);
 }
 
 void fft_op(
@@ -785,8 +784,7 @@ void nd_fft_op(
   }
 
   auto& d = metal::device(s.device);
-  d.get_command_buffer(s.index)->addCompletedHandler(
-      [temp_arrs](MTL::CommandBuffer*) mutable { temp_arrs.clear(); });
+  d.add_temporaries(std::move(temp_arrs), s.index);
 }
 
 void FFT::eval_gpu(const std::vector<array>& inputs, array& out) {

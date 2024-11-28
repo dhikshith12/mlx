@@ -80,6 +80,7 @@ Operations
    greater_equal
    hadamard_transform
    identity
+   imag
    inner
    isfinite
    isclose
@@ -125,11 +126,13 @@ Operations
    quantize
    quantized_matmul
    radians
+   real
    reciprocal
    remainder
    repeat
    reshape
    right_shift
+   roll
    round
    rsqrt
    save

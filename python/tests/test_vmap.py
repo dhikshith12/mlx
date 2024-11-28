@@ -370,6 +370,51 @@ class TestVmap(mlx_tests.MLXTestCase):
                 mx.allclose(a[:, i, :] @ invs[i], mx.eye(a.shape[0]), rtol=0, atol=1e-5)
             )
 
+    def test_vmap_gather(self):
+        def gather(a, idx):
+            return a[idx]
+
+        a = mx.array([[1, 2], [3, 4]])
+        idx = mx.array(0)
+        out = mx.vmap(gather, (0, None))(a, idx)
+        self.assertTrue(mx.array_equal(out, mx.array([1, 3])))
+
+        out = mx.vmap(gather, (1, None))(a, idx)
+        self.assertTrue(mx.array_equal(out, mx.array([1, 2])))
+
+        idx = mx.array([0, 1])
+        out = mx.vmap(gather, (0, 0))(a, idx)
+        self.assertTrue(mx.array_equal(out, mx.array([1, 4])))
+
+        a = mx.ones((2, 3, 4))
+        idx = mx.zeros(4, mx.int32)
+        out = mx.vmap(gather, (2, 0))(a, idx)
+        self.assertEqual(out.shape, (4, 3))
+
+        f = mx.vmap(gather, (0, None))
+        f = mx.vmap(gather, (0, 0))
+        out = f(mx.ones((2, 3, 4)), mx.zeros(2, dtype=mx.int32))
+        self.assertEqual(out.shape, (2, 4))
+
+        def gather(a, idxa, idxb):
+            return a[idxa, idxb]
+
+        a = mx.ones((2, 3, 4))
+        idxa = mx.zeros((2, 3), mx.int32)
+        idxb = mx.zeros(3, mx.int32)
+        out = mx.vmap(gather, (0, 0, None))(a, idxa, idxb)
+        self.assertEqual(out.shape, (2, 3))
+
+        idxa = mx.zeros((3, 1, 2), mx.int32)
+        idxb = mx.zeros((2, 3, 1, 2), mx.int32)
+        out = mx.vmap(gather, (0, None, 0))(a, idxa, idxb)
+        self.assertEqual(out.shape, (2, 3, 1, 2))
+
+        idxa = mx.zeros((3, 1, 2), mx.int32)
+        idxb = mx.zeros((3, 1, 2, 2), mx.int32)
+        out = mx.vmap(gather, (0, None, 3))(a, idxa, idxb)
+        self.assertEqual(out.shape, (2, 3, 1, 2))
+
     def test_vmap_scatter(self):
         def scatter(a):
             a[mx.array(0)] = mx.array(0.0)
@@ -461,6 +506,46 @@ class TestVmap(mlx_tests.MLXTestCase):
         expected = mx.zeros((3, 3, 4))
         expected[:, 0] = mx.array([1, 2, 3])[:, None]
         self.assertTrue(mx.allclose(out, expected))
+
+    def test_vmap_const_func(self):
+        a = mx.random.uniform(shape=(2, 3, 4))
+        b = mx.random.uniform(shape=(4, 3))
+
+        def const_func(a, b):
+            return mx.array(2)
+
+        out = mx.vmap(const_func, in_axes=(0, None))(a, b)
+        self.assertTrue(mx.array_equal(mx.full((2,), 2), out))
+        out = mx.vmap(const_func, in_axes=(None, 0))(a, b)
+        self.assertTrue(mx.array_equal(mx.full((4,), 2), out))
+        out = mx.vmap(const_func, in_axes=(1, 1))(a, b)
+        self.assertTrue(mx.array_equal(mx.full((3,), 2), out))
+
+        with self.assertRaises(ValueError):
+            out = mx.vmap(const_func, in_axes=(None, None))(a, b)
+
+        with self.assertRaises(ValueError):
+            out = mx.vmap(const_func, in_axes=(0, 0))(a, b)
+
+    def test_vmap_concatenate(self):
+        x = mx.random.uniform(shape=(2, 2, 2))
+
+        def cat_fun(x, y):
+            return mx.concatenate([x, y], axis=1)
+
+        def cat_constant(x):
+            y = mx.ones((2, 1))
+            return mx.concatenate([x, y], 1)
+
+        out = mx.vmap(cat_fun, in_axes=(0, 2))(x, x)
+        target = mx.stack(
+            [mx.concatenate([x[i], x[:, :, i]], axis=1) for i in range(2)]
+        )
+        self.assertTrue(mx.array_equal(out, target))
+
+        out = mx.vmap(cat_constant)(x)
+        target = mx.concatenate([x, mx.ones((2, 2, 1))], axis=2)
+        self.assertTrue(mx.array_equal(out, target))
 
 
 if __name__ == "__main__":

@@ -1,19 +1,15 @@
-//
-//  scaled_dot_product_attention.cpp
-//  mlx
+// Copyright © 2024 Apple Inc.
 
-#include <algorithm>
 #include <cassert>
-#include <numeric>
 #include <sstream>
 
+#include "mlx/backend/common/compiled.h"
 #include "mlx/backend/metal/copy.h"
 #include "mlx/backend/metal/device.h"
-#include "mlx/backend/metal/kernels/scaled_dot_product_attention_params.h"
-#include "mlx/backend/metal/metal.h"
+
+#include "mlx/backend/metal/kernels/steel/attn/params.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/fast_primitives.h"
-#include "mlx/primitives.h"
 #include "mlx/utils.h"
 
 namespace mlx::core::fast {
@@ -25,253 +21,234 @@ void sdpa_full_self_attention_metal(
     const array& q,
     const array& k,
     const array& v,
-    const float alpha,
-    array& out,
-    std::vector<array>& temporaries) {
-  std::ostringstream kname_self_attention;
-  kname_self_attention << "steel_gemm_attention_";
+    const float scale,
+    array& o) {
+  using namespace mlx::steel;
 
-  constexpr const int bm = 16;
-  constexpr const int bn = 16;
-  const int bk = q.shape(-1); // already forced to be 64 or 128
+  int wm = 4;
+  int wn = 1;
 
-  if (bk != 64 && bk != 128) {
-    throw std::runtime_error(
-        "[ScaledDotProductAttention::eval_gpu]: hidden dim: expected either 64, 128");
-  }
+  int bd = q.shape(-1);
+  int bq = 32;
+  int bk = bd < 128 ? 32 : 16;
 
-  constexpr const int wm = 2;
-  constexpr const int wn = 2;
+  int B = q.shape(0);
+  int H = q.shape(1);
+  int D = q.shape(3);
+  int gqa_factor = q.shape(1) / k.shape(1);
 
-  std::string delimiter = "_";
+  int qL = q.shape(2);
+  int kL = k.shape(2);
 
-  kname_self_attention << "bm_" + std::to_string(bm) + delimiter;
-  kname_self_attention << "bn_" + std::to_string(bn) + delimiter;
-  kname_self_attention << "bk_" + std::to_string(bk) + delimiter;
+  const bool align_Q = (qL % bq) == 0;
+  const bool align_K = (kL % bk) == 0;
 
-  for (const auto& arr : {k, v, out}) {
-    if (arr.dtype() != q.dtype()) {
-      throw std::runtime_error(
-          "[ScaledDotProductAttention::eval_gpu]: expected matching dtypes for q,k,v,o");
-    }
-  }
+  metal::MTLFCList func_consts = {
+      {&align_Q, MTL::DataType::DataTypeBool, 200},
+      {&align_K, MTL::DataType::DataTypeBool, 201},
+  };
 
-  if (q.dtype() == float32) {
-    kname_self_attention << "itype" + delimiter + "float";
-  } else if (q.dtype() == float16) {
-    kname_self_attention << "itype" + delimiter + "half";
-  } else {
-    throw std::runtime_error(
-        "[ScaledDotProductAttention::eval_gpu]: unexpected dtype found for queries: expected either float32 or float16.");
-  }
+  std::ostringstream kname;
+  // clang-format off
+  kname << "steel_attention_" 
+        << type_to_name(q) 
+        << "_bq" << bq 
+        << "_bk" << bk
+        << "_bd" << bd 
+        << "_wm" << wm << "_wn" << wn; // clang-format on
+
+  std::string base_name = kname.str();
+
+  // clang-format off
+  kname << "_align_Q_" << (align_Q ? 't' : 'n') 
+        << "_align_K_" << (align_K ? 't' : 'n'); // clang-format on
+
+  std::string hash_name = kname.str();
 
   auto& compute_encoder = d.get_command_encoder(s.index);
-  auto kernel = d.get_kernel(kname_self_attention.str());
-  compute_encoder->setComputePipelineState(kernel);
+  auto kernel = d.get_kernel(base_name, "mlx", hash_name, func_consts);
+  compute_encoder.set_compute_pipeline_state(kernel);
 
-  uint hidden_dim = q.shape(-1);
-  uint qseq = q.shape(-2);
-  uint qheads = q.shape(-3);
+  const int NQ = (qL + bq - 1) / bq;
+  const int NK = (kL + bk - 1) / bk;
 
-  const uint64_t KV_sequence_length = k.shape(-2);
-  const uint query_sequence_length = q.shape(-2);
-  const uint n_q_heads = q.shape(1);
-  const uint n_kv_heads = k.shape(1);
+  const int NQ_aligned = qL / bq;
+  const int NK_aligned = kL / bk;
 
-  const int M = q.shape(-2);
-  const int N = M;
-  const int K = q.shape(-1);
-  const size_t batch_size_out = q.shape(0) * q.shape(1);
+  AttnParams params{
+      /* int B = */ B,
+      /* int H = */ H,
+      /* int D = */ D,
 
-  const std::vector<int> batch_shape = {q.shape(0) * q.shape(1)};
-  const int dk = q.shape(-1);
-  const int ldq = dk;
-  const int ldk = dk;
-  const int ldv = dk;
-  const int lds = bn;
-  const int ldo = dk;
+      /* int qL = */ qL,
+      /* int kL = */ kL,
 
-  int tn = 1;
-  int tm = (M + bm - 1) / bm;
+      /* int gqa_factor = */ gqa_factor,
+      /* float scale = */ scale,
 
-  const int batch_stride_q = dk * query_sequence_length;
-  const int batch_stride_k = dk * query_sequence_length;
-  const int batch_stride_v = dk * query_sequence_length;
-  const int batch_stride_o = dk * query_sequence_length;
-  const int swizzle_log = 0;
-  const int gemm_n_iterations_aligned = (N + bn - 1) / bn;
-  const int gemm_k_iterations_aligned = (K + bk - 1) / bk;
-  const int gemm_sv_m_block_iterations = (M + bm - 1) / bm;
-  const int batch_ndim = int(batch_shape.size());
+      /* int NQ = */ NQ,
+      /* int NK = */ NK,
 
-  MLXFastAttentionParams params{
-      (int)M,
-      (int)N,
-      (int)K,
-      ldq,
-      ldk,
-      ldv,
-      lds,
-      ldo,
-      tn,
-      tm,
-      batch_stride_q,
-      batch_stride_k,
-      batch_stride_v,
-      batch_stride_o,
-      swizzle_log,
-      gemm_n_iterations_aligned,
-      gemm_k_iterations_aligned,
-      gemm_sv_m_block_iterations,
-      batch_ndim,
-      alpha};
+      /* int NQ_aligned = */ NQ_aligned,
+      /* int NK_aligned = */ NK_aligned,
 
-  const std::vector<size_t> batch_strides = {
-      (size_t)batch_stride_q,
-      (size_t)batch_stride_k,
-      (size_t)batch_stride_v,
-      (size_t)batch_stride_o};
+      /* size_t Q_strides[3] = */ {q.strides(0), q.strides(1), q.strides(2)},
+      /* size_t K_strides[3] = */ {k.strides(0), k.strides(1), k.strides(2)},
+      /* size_t V_strides[3] = */ {v.strides(0), v.strides(1), v.strides(2)},
+      /* size_t O_strides[3] = */ {o.strides(0), o.strides(1), o.strides(2)}};
 
   compute_encoder.set_input_array(q, 0);
   compute_encoder.set_input_array(k, 1);
   compute_encoder.set_input_array(v, 2);
-  compute_encoder.set_output_array(out, 3);
+  compute_encoder.set_output_array(o, 3);
+  compute_encoder.set_bytes(params, 4);
 
-  compute_encoder->setBytes(&params, sizeof(MLXFastAttentionParams), 4);
-  compute_encoder->setBytes(
-      batch_shape.data(), sizeof(int) * batch_shape.size(), 6);
-
-  compute_encoder->setBytes(
-      batch_strides.data(), sizeof(size_t) * batch_strides.size(), 7);
-
-  MTL::Size grid_dims = MTL::Size(1, tm, batch_size_out);
+  MTL::Size grid_dims = MTL::Size(NQ, H, B);
   MTL::Size group_dims = MTL::Size(32, wm, wn);
 
-  compute_encoder->dispatchThreadgroups(grid_dims, group_dims);
-
-  d.get_command_buffer(s.index)->addCompletedHandler(
-      [temporaries](MTL::CommandBuffer*) mutable { temporaries.clear(); });
-  return;
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
-void sdpa_metal(
+void sdpa_vector(
     const Stream& s,
     metal::Device& d,
     const array& q,
     const array& k,
     const array& v,
-    const array& p_lse,
-    const array& p_rowmaxes,
-    const array& o_partial,
-    const uint heads,
-    const uint tile_size,
-    const uint n_tiles,
-    const float alpha,
     array& out,
-    std::vector<array>& temporaries) {
-  std::ostringstream kname_partials;
+    float scale) {
+  // Set the kernel name
+  std::string kname;
+  kname.reserve(64);
+  kname += "sdpa_vector_";
+  kname += get_type_string(q.dtype());
+  kname += "_";
+  kname += std::to_string(q.shape(-1));
 
-  kname_partials << "fast_inference_sdpa_compute_partials_";
+  // Compute the necessary sizes
+  int gqa_factor = q.shape(1) / k.shape(1);
+  int N = k.shape(2);
+  int B = q.shape(0) * q.shape(1);
+  size_t k_stride = k.strides()[1];
+  size_t v_stride = v.strides()[1];
+  MTL::Size group_dims(1024, 1, 1);
+  MTL::Size grid_dims(1, B, 1);
 
-  std::ostringstream kname_reduce;
-  std::string delimiter = "_";
-  kname_reduce << "fast_inference_sdpa_reduce_tiles" + delimiter;
-
-  for (const auto& arr : {k, v, out}) {
-    if (arr.dtype() != q.dtype()) {
-      throw std::runtime_error(
-          "[ScaledDotProductAttention::eval_gpu]: expected matching dtypes for q,k,v,o");
-    }
-  }
-
-  if (q.dtype() == float32) {
-    kname_partials << "float" + delimiter;
-    kname_reduce << "float";
-  } else if (q.dtype() == float16) {
-    kname_partials << "half" + delimiter;
-    kname_reduce << "half";
-  } else {
-    throw std::runtime_error(
-        "[ScaledDotProductAttention::eval_gpu]: unexpected dtype found for queries: expected either float32 or float16.");
-  }
-
-  std::string kname_suffix_tile_size = std::to_string(tile_size) + delimiter;
-
-  uint nsimd = 8;
-  std::string kname_suffix_nsimdgroups = std::to_string(nsimd);
-
-  // maximum number of splits == 128 at the moment (reserved tile registers in
-  // reduction kernel). this is arbitrary and could be changed in the shader.
-
-  std::string kname_suffix = kname_suffix_tile_size + kname_suffix_nsimdgroups;
-  kname_partials << kname_suffix;
+  // Get the kernel
   auto& compute_encoder = d.get_command_encoder(s.index);
-  auto kernel = d.get_kernel(kname_partials.str());
-  compute_encoder->setComputePipelineState(kernel);
+  auto kernel = d.get_kernel(kname);
+  compute_encoder.set_compute_pipeline_state(kernel);
 
-  constexpr const uint batch = 1;
-  MTL::Size grid_dims = MTL::Size(heads, n_tiles, batch);
-  MTL::Size group_dims = MTL::Size(32, nsimd, 1);
-
-  const uint64_t KV_sequence_length = k.shape(-2);
-  const uint query_sequence_length = q.shape(-2);
-  const uint n_q_heads = q.shape(1);
-  const uint n_kv_heads = k.shape(1);
-
-  MLXScaledDotProductAttentionParams params{
-      query_sequence_length, n_q_heads, n_kv_heads, n_tiles, alpha};
-
-  compute_encoder.set_input_array(q, 0);
+  // Set its arguments
+  compute_encoder.set_input_array(q.data_shared_ptr() == nullptr ? out : q, 0);
   compute_encoder.set_input_array(k, 1);
   compute_encoder.set_input_array(v, 2);
-  compute_encoder->setBytes(&KV_sequence_length, sizeof(KV_sequence_length), 3);
-  compute_encoder->setBytes(
-      &params, sizeof(MLXScaledDotProductAttentionParams), 4);
-  compute_encoder.set_input_array(o_partial, 5);
-  compute_encoder.set_input_array(p_lse, 6);
-  compute_encoder.set_input_array(p_rowmaxes, 7);
+  compute_encoder.set_output_array(out, 3);
+  compute_encoder.set_bytes(gqa_factor, 4);
+  compute_encoder.set_bytes(N, 5);
+  compute_encoder.set_bytes(k_stride, 6);
+  compute_encoder.set_bytes(v_stride, 7);
+  compute_encoder.set_bytes(scale, 8);
 
-  constexpr const uint tgroupMemorySize = 32768;
-  compute_encoder->setThreadgroupMemoryLength(tgroupMemorySize, 0);
-  compute_encoder.dispatchThreadgroups(grid_dims, group_dims);
-
-  {
-    auto kernel_accum = d.get_kernel(kname_reduce.str());
-    compute_encoder->setComputePipelineState(kernel_accum);
-    compute_encoder.set_input_array(o_partial, 0);
-    compute_encoder.set_input_array(p_lse, 1);
-    compute_encoder.set_input_array(p_rowmaxes, 2);
-    compute_encoder->setBytes(
-        &params, sizeof(MLXScaledDotProductAttentionParams), 3);
-    compute_encoder.set_output_array(out, 4);
-
-    MTL::Size grid_dims_reduce = MTL::Size(heads, 1, batch);
-    MTL::Size group_dims_reduce = MTL::Size(128, 1, 1);
-
-    compute_encoder.dispatchThreadgroups(grid_dims_reduce, group_dims_reduce);
-
-    d.get_command_buffer(s.index)->addCompletedHandler(
-        [temporaries](MTL::CommandBuffer*) mutable { temporaries.clear(); });
-    return;
-  }
+  // Launch
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
+
+void sdpa_vector_2pass(
+    const Stream& s,
+    metal::Device& d,
+    const array& q,
+    const array& k,
+    const array& v,
+    array& out,
+    float scale) {
+  // Set the kernel name
+  std::string kname;
+  kname.reserve(64);
+  kname += "sdpa_vector_2pass_1_";
+  kname += get_type_string(q.dtype());
+  kname += "_";
+  kname += std::to_string(q.shape(-1));
+
+  // Compute the necessary sizes
+  int gqa_factor = q.shape(1) / k.shape(1);
+  int N = k.shape(2);
+  int blocks = 32;
+  int B = q.shape(0) * q.shape(1);
+  size_t k_stride = k.strides()[1];
+  size_t v_stride = v.strides()[1];
+  MTL::Size group_dims(8 * 32, 1, 1);
+  MTL::Size grid_dims(1, B, blocks);
+
+  // Allocate the intermediates
+  std::vector<int> intermediate_shape;
+  intermediate_shape.reserve(out.ndim() + 1);
+  intermediate_shape.insert(
+      intermediate_shape.end(), out.shape().begin(), out.shape().end() - 1);
+  intermediate_shape.push_back(blocks);
+  intermediate_shape.push_back(out.shape().back());
+  array intermediate(intermediate_shape, float32, nullptr, {});
+  intermediate_shape.pop_back();
+  array sums(intermediate_shape, float32, nullptr, {});
+  array maxs(std::move(intermediate_shape), float32, nullptr, {});
+  intermediate.set_data(allocator::malloc_or_wait(intermediate.nbytes()));
+  sums.set_data(allocator::malloc_or_wait(sums.nbytes()));
+  maxs.set_data(allocator::malloc_or_wait(maxs.nbytes()));
+  d.add_temporary(intermediate, s.index);
+  d.add_temporary(sums, s.index);
+  d.add_temporary(maxs, s.index);
+
+  // Get the kernel
+  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto kernel = d.get_kernel(kname);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  // Set its arguments
+  compute_encoder.set_input_array(q.data_shared_ptr() == nullptr ? out : q, 0);
+  compute_encoder.set_input_array(k, 1);
+  compute_encoder.set_input_array(v, 2);
+  compute_encoder.set_output_array(intermediate, 3);
+  compute_encoder.set_output_array(sums, 4);
+  compute_encoder.set_output_array(maxs, 5);
+  compute_encoder.set_bytes(gqa_factor, 6);
+  compute_encoder.set_bytes(N, 7);
+  compute_encoder.set_bytes(k_stride, 8);
+  compute_encoder.set_bytes(v_stride, 9);
+  compute_encoder.set_bytes(scale, 10);
+
+  // Launch
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+
+  // Final pass
+  kname.clear();
+  kname += "sdpa_vector_2pass_2_";
+  kname += get_type_string(q.dtype());
+  kname += "_";
+  kname += std::to_string(q.shape(-1));
+
+  // Get the kernel
+  kernel = d.get_kernel(kname);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  // Set its arguments
+  compute_encoder.set_input_array(intermediate, 0);
+  compute_encoder.set_input_array(sums, 1);
+  compute_encoder.set_input_array(maxs, 2);
+  compute_encoder.set_output_array(out, 3);
+
+  // Launch
+  group_dims = MTL::Size(1024, 1, 1);
+  grid_dims = MTL::Size(1, B, 1);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 } // namespace
 
 void ScaledDotProductAttention::eval_gpu(
     const std::vector<array>& inputs,
     array& out) {
-  assert(inputs.size() >= 3);
-  if (!issubdtype(out.dtype(), floating)) {
-    throw std::runtime_error(
-        "[ScaledDotProductAttention] Does not yet support non-floating point types.");
-  }
+  assert(inputs.size() == 3);
 
-  if (inputs.size() == 4) {
-    out = fallback_(inputs)[0];
-    return;
-  }
-
-  out.set_data(allocator::malloc_or_wait(out.nbytes()));
   auto& s = stream();
   auto& d = metal::device(s.device);
 
@@ -279,84 +256,98 @@ void ScaledDotProductAttention::eval_gpu(
   auto& k_pre = inputs[1];
   auto& v_pre = inputs[2];
   auto& o = out;
-  /////////////////////////////////////////////////////////////////////////////
-  // Init checks and prep
 
-  // Keep a vector with copies to be cleared in the completed buffer to release
-  // the arrays
-  std::vector<array> temporaries;
-  auto check_transpose = [&temporaries, &s](const array& arr) {
-    auto stx = arr.strides()[arr.ndim() - 2];
-    auto sty = arr.strides()[arr.ndim() - 1];
-    if (stx == arr.shape(-1) && sty == 1) {
-      return arr;
-    } else {
+  std::vector<array> copies;
+
+  // Define some copy functions to ensure the layout of the inputs is as
+  // expected.
+  copies.reserve(3);
+  auto copy_unless = [&copies, &s](
+                         auto predicate, const array& arr) -> const array& {
+    if (!predicate(arr)) {
       array arr_copy(arr.shape(), arr.dtype(), nullptr, {});
       copy_gpu(arr, arr_copy, CopyType::General, s);
-      temporaries.push_back(arr_copy);
-      size_t stx = arr.shape(-1);
-      return arr_copy;
+      copies.push_back(arr_copy);
+      return copies.back();
+    } else {
+      return arr;
     }
   };
 
-  auto q = check_transpose(q_pre);
-  auto k = check_transpose(k_pre);
-  auto v = check_transpose(v_pre);
+  // Checks if arr is fully row contiguous
+  auto is_contiguous = [](const array& arr) {
+    return arr.flags().row_contiguous;
+  };
 
-  const int heads = q.shape(-3);
+  // Returns true if the array is row contiguous except the sequence length
+  // dimension that can be sliced but with step=1.
+  auto is_contiguous_except_seq_len = [](const array& arr) {
+    auto& strides = arr.strides();
+    auto& shape = arr.shape();
+    return strides[3] == 1 && strides[2] == shape[3] &&
+        strides[0] == strides[1] * shape[1];
+  };
 
-  uint query_sequence_length = q.shape(-2);
-  if (query_sequence_length >= 16) {
-    return sdpa_full_self_attention_metal(
-        s, d, q, k, v, scale_, out, temporaries);
+  // Checks that the last two dims are row contiguous.
+  auto is_matrix_contiguous = [](const array& arr) {
+    auto& strides = arr.strides();
+    auto& shape = arr.shape();
+    return strides[3] == 1 && strides[2] == shape[3];
+  };
+
+  // We are in vector mode ie single query
+  if (q_pre.shape(2) == 1) {
+    const auto& q = copy_unless(is_contiguous, q_pre);
+    const auto& k = copy_unless(is_contiguous_except_seq_len, k_pre);
+    const auto& v = copy_unless(is_contiguous_except_seq_len, v_pre);
+
+    // Donate the query if possible
+    if (q.is_donatable()) {
+      o.move_shared_buffer(q);
+    } else {
+      o.set_data(allocator::malloc_or_wait(o.nbytes()));
+    }
+
+    // We route to the 2 pass fused attention if
+    // - The device is large and the sequence length long
+    // - The sequence length is even longer and we have gqa
+    char devc = d.get_architecture().back();
+    if ((devc == 'd' && k.shape(2) >= 1024) ||
+        (k.shape(1) < q.shape(1) && k.shape(2) >= 4096)) {
+      sdpa_vector_2pass(s, d, q, k, v, o, scale_);
+    } else {
+      sdpa_vector(s, d, q, k, v, o, scale_);
+    }
   }
-  int tile_size = 64;
-  const int kv_seq_len = k.shape(-2);
-  if (kv_seq_len > 8000) {
-    tile_size = 128;
+
+  // Full attention mode
+  else {
+    const auto& q = copy_unless(is_matrix_contiguous, q_pre);
+    const auto& k = copy_unless(is_matrix_contiguous, k_pre);
+    const auto& v = copy_unless(is_matrix_contiguous, v_pre);
+
+    size_t str_oD = 1;
+    size_t str_oH = o.shape(3);
+    size_t str_oL = o.shape(1) * str_oH;
+    size_t str_oB = o.shape(2) * str_oL;
+    size_t data_size = o.shape(0) * str_oB;
+
+    array::Flags flags{
+        /* bool contiguous = */ 1,
+        /* bool row_contiguous = */ 0,
+        /* bool col_contiguous = */ 0,
+    };
+
+    o.set_data(
+        allocator::malloc_or_wait(o.nbytes()),
+        data_size,
+        {str_oB, str_oH, str_oL, str_oD},
+        flags);
+
+    sdpa_full_self_attention_metal(s, d, q, k, v, scale_, o);
   }
-  if (kv_seq_len > 16000) {
-    tile_size = 256;
-  }
-  if (kv_seq_len > 32000) {
-    tile_size = 512;
-  }
 
-  const int n_tiles = (kv_seq_len + tile_size - 1) / tile_size;
-
-  array o_partials(
-      {q.shape(-4), q.shape(-3), q.shape(-2), n_tiles * v.shape(-1)},
-      float32,
-      nullptr,
-      {});
-  o_partials.set_data(allocator::malloc_or_wait(o_partials.nbytes()));
-
-  array p_lse(
-      {q.shape(-4), q.shape(-3), q.shape(-2), n_tiles}, float32, nullptr, {});
-  array p_rowmaxes(
-      {q.shape(-4), q.shape(-3), q.shape(-2), n_tiles}, float32, nullptr, {});
-  p_lse.set_data(allocator::malloc_or_wait(p_lse.nbytes()));
-  p_rowmaxes.set_data(allocator::malloc_or_wait(p_rowmaxes.nbytes()));
-
-  temporaries.push_back(p_lse);
-  temporaries.push_back(p_rowmaxes);
-  temporaries.push_back(o_partials);
-
-  return sdpa_metal(
-      s,
-      d,
-      q,
-      k,
-      v,
-      p_lse,
-      p_rowmaxes,
-      o_partials,
-      heads,
-      tile_size,
-      n_tiles,
-      scale_,
-      out,
-      temporaries);
+  d.add_temporaries(std::move(copies), s.index);
 }
 
 } // namespace mlx::core::fast

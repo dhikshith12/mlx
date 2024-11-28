@@ -1,31 +1,17 @@
 // Copyright © 2023-2024 Apple Inc.
-#include <cstdlib>
 #include <memory>
 
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"
 #include "mlx/primitives.h"
 #include "mlx/scheduler.h"
+#include "mlx/utils.h"
 
 namespace mlx::core::metal {
 
 bool is_available() {
   return true;
 }
-
-int max_ops_per_buffer() {
-  auto get_val = []() {
-    if (const char* buff_str = std::getenv("MLX_MAX_OPS_PER_BUFFER")) {
-      return atoi(buff_str);
-    } else {
-      return 10;
-    }
-  };
-  static int max_ops_per_buffer_ = get_val();
-  return max_ops_per_buffer_;
-}
-
-#define MAX_OPS_PER_BUFFER max_ops_per_buffer()
 
 inline void check_error(MTL::CommandBuffer* cbuf) {
   if (cbuf->status() == MTL::CommandBufferStatusError) {
@@ -74,10 +60,11 @@ std::function<void()> make_task(array arr, bool signal) {
       arr.detach();
     }
     for (auto& out : outputs) {
-      out.set_status(array::Status::available);
+      out.set_status(array::Status::evaluated);
     }
 
-    if (signal || d.get_command_buffer_ops(s.index) >= MAX_OPS_PER_BUFFER) {
+    if (signal ||
+        d.get_command_buffer_ops(s.index) >= env::max_ops_per_buffer()) {
       d.end_encoding(s.index);
       if (signal) {
         command_buffer->encodeSignalEvent(
@@ -107,6 +94,7 @@ std::function<void()> make_synchronize_task(
     Stream s,
     std::shared_ptr<std::promise<void>> p) {
   return [s, p = std::move(p)]() {
+    auto pool = new_scoped_memory_pool();
     auto& d = metal::device(s.device);
     auto cb = d.get_command_buffer(s.index);
     cb->retain();

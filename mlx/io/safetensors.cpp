@@ -1,12 +1,14 @@
 // Copyright © 2023 Apple Inc.
 //
 #include <json.hpp>
+#include <memory>
 #include <stack>
 
 #include "mlx/io.h"
 #include "mlx/io/load.h"
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
+#include "mlx/transforms.h"
 
 using json = nlohmann::json;
 
@@ -58,6 +60,8 @@ std::string dtype_to_safetensor_str(Dtype t) {
       return ST_BOOL;
     case complex64:
       return ST_C64;
+    default:
+      throw std::runtime_error("[save_safetensors] received invalid dtype.");
   }
 }
 
@@ -106,15 +110,17 @@ SafetensorsLoad load_safetensors(
   }
 
   uint64_t jsonHeaderLength = 0;
+  // This is the same limit as in the original Rust Safetensors code.
+  constexpr uint64_t kMaxJsonHeaderLength = 100000000;
   in_stream->read(reinterpret_cast<char*>(&jsonHeaderLength), 8);
-  if (jsonHeaderLength <= 0) {
+  if (jsonHeaderLength <= 0 || jsonHeaderLength >= kMaxJsonHeaderLength) {
     throw std::runtime_error(
         "[load_safetensors] Invalid json header length " + in_stream->label());
   }
   // Load the json metadata
-  char rawJson[jsonHeaderLength];
-  in_stream->read(rawJson, jsonHeaderLength);
-  auto metadata = json::parse(rawJson, rawJson + jsonHeaderLength);
+  auto rawJson = std::make_unique<char[]>(jsonHeaderLength);
+  in_stream->read(rawJson.get(), jsonHeaderLength);
+  auto metadata = json::parse(rawJson.get(), rawJson.get() + jsonHeaderLength);
   // Should always be an object on the top-level
   if (!metadata.is_object()) {
     throw std::runtime_error(
@@ -169,25 +175,22 @@ void save_safetensors(
     _metadata[key] = value;
   }
   parent["__metadata__"] = _metadata;
+
+  {
+    std::vector<array> to_eval;
+    to_eval.reserve(a.size());
+    for (auto& p : a) {
+      p.second = contiguous(p.second);
+      to_eval.push_back(p.second);
+    }
+    eval(std::move(to_eval));
+  }
+
   size_t offset = 0;
   for (auto& [key, arr] : a) {
-    arr.eval();
     if (arr.nbytes() == 0) {
       throw std::invalid_argument(
           "[save_safetensors] cannot serialize an empty array key: " + key);
-    }
-
-    // Try to make it row contiguous
-    if (!arr.flags().row_contiguous) {
-      arr = reshape(flatten(arr), arr.shape());
-      arr.eval();
-    }
-
-    // Has to be row-major now but, check one more time in case
-    // any of the above change in the future
-    if (!arr.flags().row_contiguous) {
-      throw std::invalid_argument(
-          "[save_safetensors] can only serialize row-major arrays");
     }
 
     json child;

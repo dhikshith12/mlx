@@ -140,57 +140,25 @@ void init_fast(nb::module_& parent_module) {
         Note: For Grouped Query Attention and Multi-Query Attention, the ``k``
         and ``v`` inputs should not be pre-tiled to match ``q``.
 
+        In the following the dimensions are given by:
+
+        * ``B``: The batch size.
+        * ``N_q``: The number of query heads.
+        * ``N_kv``: The number of key and value heads.
+        * ``T_q``: The number of queries per example.
+        * ``T_kv``: The number of keys and values per example.
+        * ``D``: The per-head dimension.
+
         Args:
-            q (array): Input query array.
-            k (array): Input keys array.
-            v (array): Input values array.
+            q (array): Queries with shape ``[B, N_q, T_q, D]``.
+            k (array): Keys with shape ``[B, N_kv, T_kv, D]``.
+            v (array): Values with shape ``[B, N_kv, T_kv, D]``.
             scale (float): Scale for queries (typically ``1.0 / sqrt(q.shape(-1)``)
-            mask (array, optional): An additive mask to apply to the query-key scores.
+            mask (array, optional): An additive mask to apply to the query-key
+               scores. The mask can have at most 4 dimensions and must be
+               broadcast-compatible with the shape ``[B, N, T_q, T_kv]``.
         Returns:
             array: The output array.
-      )pbdoc");
-
-  m.def(
-      "affine_quantize",
-      nb::overload_cast<
-          const array&,
-          const array&,
-          const array&,
-          int,
-          int,
-          StreamOrDevice>(&fast::affine_quantize),
-      "w"_a,
-      "scales"_a,
-      "biases"_a,
-      "group_size"_a = 64,
-      "bits"_a = 4,
-      nb::kw_only(),
-      "stream"_a = nb::none(),
-      nb::sig(
-          "def affine_quantize(w: array, /, scales: array, biases: array, group_size: int = 64, bits: int = 4, *, stream: Union[None, Stream, Device] = None) -> array"),
-      R"pbdoc(
-        Quantize the matrix ``w`` using the provided ``scales`` and
-        ``biases`` and the ``group_size`` and ``bits`` configuration.
-
-        Formally, given the notation in :func:`quantize`, we compute
-        :math:`w_i` from :math:`\hat{w_i}` and corresponding :math:`s` and
-        :math:`\beta` as follows
-
-        .. math::
-
-          w_i = s (\hat{w_i} + \beta)
-
-        Args:
-          w (array): Matrix to be quantize
-          scales (array): The scales to use per ``group_size`` elements of ``w``
-          biases (array): The biases to use per ``group_size`` elements of ``w``
-          group_size (int, optional): The size of the group in ``w`` that shares a
-            scale and bias. (default: ``64``)
-          bits (int, optional): The number of bits occupied by each element in
-            ``w``. (default: ``4``)
-
-        Returns:
-          array: The quantized version of ``w``
       )pbdoc");
 
   m.def(
@@ -278,7 +246,9 @@ void init_fast(nb::module_& parent_module) {
               output_shapes (List[Sequence[int]]): The list of shapes for each output in ``output_names``.
               output_dtypes (List[Dtype]): The list of data types for each output in ``output_names``.
               grid (tuple[int, int, int]): 3-tuple specifying the grid to launch the kernel with.
+                This will be passed to ``MTLComputeCommandEncoder::dispatchThreads``.
               threadgroup (tuple[int, int, int]): 3-tuple specifying the threadgroup size to use.
+                This will be passed to ``MTLComputeCommandEncoder::dispatchThreads``.
               template (List[Tuple[str, Union[bool, int, Dtype]]], optional): Template arguments.
                   These will be added as template arguments to the kernel definition. Default: ``None``.
               init_value (float, optional): Optional value to use to initialize all of the output arrays.
@@ -299,6 +269,8 @@ void init_fast(nb::module_& parent_module) {
       "atomic_outputs"_a = false,
       R"pbdoc(
       A jit-compiled custom Metal kernel defined from a source string.
+
+      Full documentation: :ref:`custom_metal_kernels`.
 
       Args:
         name (str): Name for the kernel.

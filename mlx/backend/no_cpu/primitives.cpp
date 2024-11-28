@@ -1,6 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
 #include "mlx/primitives.h"
+#include "mlx/fast_primitives.h"
 
 #define NO_CPU_MULTI(func)                                             \
   void func::eval_cpu(                                                 \
@@ -38,6 +39,7 @@ NO_CPU(Ceil)
 NO_CPU(Cholesky)
 NO_CPU(Concatenate)
 NO_CPU(Conjugate)
+NO_CPU(Contiguous)
 NO_CPU(Convolution)
 NO_CPU(Copy)
 NO_CPU(Cos)
@@ -48,6 +50,7 @@ NO_CPU(Divide)
 NO_CPU_MULTI(DivMod)
 NO_CPU(NumberOfElements)
 NO_CPU(Remainder)
+NO_CPU_MULTI(Eigh)
 NO_CPU(Equal)
 NO_CPU(Erf)
 NO_CPU(ErfInv)
@@ -62,6 +65,7 @@ NO_CPU(GatherQMM)
 NO_CPU(Greater)
 NO_CPU(GreaterEqual)
 NO_CPU(Hadamard)
+NO_CPU(Imag)
 NO_CPU(Less)
 NO_CPU(LessEqual)
 NO_CPU(Load)
@@ -83,6 +87,7 @@ NO_CPU(Power)
 NO_CPU_MULTI(QRF)
 NO_CPU(QuantizedMatmul)
 NO_CPU(RandomBits)
+NO_CPU(Real)
 NO_CPU(Reduce)
 NO_CPU(Reshape)
 NO_CPU(Round)
@@ -108,5 +113,9 @@ NO_CPU(Tanh)
 NO_CPU(Transpose)
 NO_CPU(Inverse)
 NO_CPU(View)
+
+namespace fast {
+NO_CPU_MULTI(AffineQuantize)
+} // namespace fast
 
 } // namespace mlx::core

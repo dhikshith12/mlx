@@ -14,7 +14,7 @@ silicon computer is
 To install from PyPI you must meet the following requirements:
 
 - Using an M series chip (Apple silicon)
-- Using a native Python >= 3.8
+- Using a native Python >= 3.9
 - macOS >= 13.5
 
 .. note::
@@ -209,7 +209,7 @@ Metal library by run-time compiling kernels the first time they are used in MLX
 on a given machine. Note run-time compilation incurs a cold-start cost which can
 be anwywhere from a few hundred millisecond to a few seconds depending on the
 application. Once a kernel is compiled, it will be cached by the system. The
-Metal kernel cache persists accross reboots.
+Metal kernel cache persists across reboots.
 
 Troubleshooting
 ^^^^^^^^^^^^^^^
@@ -240,7 +240,7 @@ x86 Shell
 
 .. _build shell:
 
-If the ouptut of ``uname -p``  is ``x86`` then your shell is running as x86 via
+If the output of ``uname -p``  is ``x86`` then your shell is running as x86 via
 Rosetta instead of natively.
 
 To fix this, find the application in Finder (``/Applications`` for iTerm,
@@ -264,4 +264,4 @@ Also check that cmake is using the correct architecture:
 
 If you see ``"x86_64"``, try re-installing ``cmake``. If you see ``"arm64"``
 but the build errors out with "Building for x86_64 on macOS is not supported."
-wipe your build cahce with ``rm -rf build/`` and try again.
+wipe your build cache with ``rm -rf build/`` and try again.

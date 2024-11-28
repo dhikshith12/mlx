@@ -1287,10 +1287,10 @@ array conv_transpose3d(
 
 /** Quantized matmul multiplies x with a quantized matrix w*/
 array quantized_matmul(
-    const array& x,
-    const array& w,
-    const array& scales,
-    const array& biases,
+    array x,
+    array w,
+    array scales,
+    array biases,
     bool transpose = true,
     int group_size = 64,
     int bits = 4,
@@ -1456,6 +1456,42 @@ array right_shift(const array& a, const array& b, StreamOrDevice s = {});
 array operator>>(const array& a, const array& b);
 
 array view(const array& a, const Dtype& dtype, StreamOrDevice s = {});
+
+/** Roll elements along an axis and introduce them on the other side */
+array roll(const array& a, int shift, StreamOrDevice s = {});
+array roll(
+    const array& a,
+    const std::vector<int>& shift,
+    StreamOrDevice s = {});
+array roll(const array& a, int shift, int axis, StreamOrDevice s = {});
+array roll(
+    const array& a,
+    int shift,
+    const std::vector<int>& axes,
+    StreamOrDevice s = {});
+array roll(
+    const array& a,
+    const std::vector<int>& shift,
+    int axis,
+    StreamOrDevice s = {});
+array roll(
+    const array& a,
+    const std::vector<int>& shift,
+    const std::vector<int>& axes,
+    StreamOrDevice s = {});
+
+/* The real part of a complex array. */
+array real(const array& a, StreamOrDevice s = {});
+
+/* The imaginary part of a complex array. */
+array imag(const array& a, StreamOrDevice s = {});
+
+/* Ensure the array's underlying memory is contiguous. */
+array contiguous(
+    const array& a,
+    bool allow_col_major = false,
+    StreamOrDevice s = {});
+
 /** @} */
 
 } // namespace mlx::core

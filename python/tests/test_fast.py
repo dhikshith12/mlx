@@ -308,6 +308,11 @@ class TestFast(mlx_tests.MLXTestCase):
         rx_fast = mx.fast.rms_norm(x, weight, eps)
         self.assertLess(mx.abs(rx - rx_fast).max(), 1e-6)
 
+        # Wrong size w raises
+        with self.assertRaises(ValueError):
+            x = mx.random.uniform(shape=(1, 5))
+            mx.fast.rms_norm(x, mx.ones((4,)), 1e-5)
+
     def test_rms_norm_grad(self):
         D = 32
         eps = 1e-5
@@ -543,18 +548,6 @@ class TestFast(mlx_tests.MLXTestCase):
             )
         )(x)
         self.assertTrue(mx.allclose(vmap_out, vmap_fast_out))
-
-    def test_affine_quantize(self):
-        mx.random.seed(7)
-        x = mx.random.uniform(shape=(4, 1024))
-        for bits in (2, 4, 8):
-            for group_size in (32, 64, 128):
-                with self.subTest(bits=bits, group_size=group_size):
-                    w, scales, biases = mx.quantize(x, bits=bits, group_size=group_size)
-                    w_p = mx.fast.affine_quantize(
-                        x, scales, biases, bits=bits, group_size=group_size
-                    )
-                    self.assertTrue(mx.allclose(w, w_p))
 
     @unittest.skipIf(not mx.metal.is_available(), "Metal is not available")
     def test_custom_kernel_basic(self):

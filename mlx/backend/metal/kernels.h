@@ -15,6 +15,7 @@ MTL::ComputePipelineState* get_arange_kernel(
 MTL::ComputePipelineState* get_unary_kernel(
     metal::Device& d,
     const std::string& kernel_name,
+    Dtype in_type,
     Dtype out_type,
     const std::string op);
 
@@ -78,15 +79,18 @@ MTL::ComputePipelineState* get_mb_sort_kernel(
 MTL::ComputePipelineState* get_reduce_init_kernel(
     metal::Device& d,
     const std::string& kernel_name,
-    const array& out);
+    const std::string& func_name,
+    const std::string& op_name,
+    const Dtype& out_type);
 
 MTL::ComputePipelineState* get_reduce_kernel(
     metal::Device& d,
     const std::string& kernel_name,
     const std::string& func_name,
     const std::string& op_name,
-    const array& in,
-    const array& out,
+    const Dtype& in_type,
+    const Dtype& out_type,
+    const std::string& idx_t,
     int ndim = -1,
     int bm = -1,
     int bn = -1);
@@ -208,10 +212,10 @@ get_template_definition(std::string name, std::string func, Args... args) {
   };
   (add_arg(args), ...);
   s << ">";
-  std::string base_string = R"(
-template [[host_name("{0}")]] [[kernel]] decltype({1}) {1};
-  )";
-  return fmt::format(base_string, name, s.str());
+  return fmt::format(
+      "\ntemplate [[host_name(\"{0}\")]] [[kernel]] decltype({1}) {1};\n",
+      name,
+      s.str());
 }
 
 } // namespace mlx::core
